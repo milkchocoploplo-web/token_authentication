@@ -497,7 +497,7 @@ function escapeHtml(s) {
 }
 
 // === スリープ防止 ===
-const SELF_PING_URL = 'https://hitsu-hack-server-bn9a.onrender.com/dashboard';
+const SELF_PING_URL = 'https://token-authentication-j0r3.onrender.com/dashboard';
 const PING_INTERVAL_MS = 7 * 60 * 1000;
 
 function startSelfPing() {
@@ -513,6 +513,6 @@ function startSelfPing() {
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
-  console.log(`ログイン: https://hitsu-hack-server-bn9a.onrender.com`);
+  console.log(`ログイン: https://token-authentication-j0r3.onrender.com/dashboard`);
   startSelfPing();
 });
