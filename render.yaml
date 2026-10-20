@@ -1,7 +1,7 @@
 # render.yaml
 services:
   - type: web
-    name: hitsu-hack-server
+    name: token_authentication
     env: node
     buildCommand: npm install
     startCommand: npm start
