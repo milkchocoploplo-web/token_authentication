@@ -1,4 +1,4 @@
-// server.js - 完全版（パスワード引き継ぎ対応）
+// server.js - 完全版（セッション維持対応）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -29,9 +29,9 @@ function generateToken() {
   return result.join('');
 }
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123'; // 環境変数がない場合のフォールバック
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
-// === express ミドルウェア（画像アップロード用にlimit拡張） ===
+// === express ミドルウェア ===
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(express.json({ limit: '15mb' }));
 
@@ -99,22 +99,13 @@ db.serialize(() => {
   `);
 });
 
-// 既存のマイグレーション
 db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (err) return;
   const cols = (rows || []).map(r => r.name);
-  if (!cols.includes('device_id')) {
-    db.run("ALTER TABLE tokens ADD COLUMN device_id TEXT DEFAULT NULL");
-  }
-  if (!cols.includes('device_info')) {
-    db.run("ALTER TABLE tokens ADD COLUMN device_info TEXT DEFAULT NULL");
-  }
-  if (!cols.includes('first_used')) {
-    db.run("ALTER TABLE tokens ADD COLUMN first_used DATETIME DEFAULT NULL");
-  }
-  if (!cols.includes('order_id')) {
-    db.run("ALTER TABLE tokens ADD COLUMN order_id TEXT DEFAULT NULL");
-  }
+  if (!cols.includes('device_id')) db.run("ALTER TABLE tokens ADD COLUMN device_id TEXT DEFAULT NULL");
+  if (!cols.includes('device_info')) db.run("ALTER TABLE tokens ADD COLUMN device_info TEXT DEFAULT NULL");
+  if (!cols.includes('first_used')) db.run("ALTER TABLE tokens ADD COLUMN first_used DATETIME DEFAULT NULL");
+  if (!cols.includes('order_id')) db.run("ALTER TABLE tokens ADD COLUMN order_id TEXT DEFAULT NULL");
 });
 
 // === キャッシュ ===
@@ -122,10 +113,7 @@ let tokenCache = {};
 async function updateCache() {
   return new Promise((resolve) => {
     db.all("SELECT * FROM tokens", (err, rows) => {
-      if (err) {
-        console.error("キャッシュ更新失敗:", err);
-        return resolve();
-      }
+      if (err) { console.error("キャッシュ更新失敗:", err); return resolve(); }
       tokenCache = {};
       rows.forEach(row => tokenCache[row.token] = row);
       resolve();
@@ -133,9 +121,7 @@ async function updateCache() {
   });
 }
 
-updateCache().then(() => {
-  console.log(`キャッシュロード: ${Object.keys(tokenCache).length}トークン`);
-});
+updateCache().then(() => console.log(`キャッシュロード: ${Object.keys(tokenCache).length}トークン`));
 
 // === ログインHTML ===
 function getLoginHTML(error = '') {
@@ -175,8 +161,6 @@ function requireAuth(req, res, next) {
 
 // === ルート ===
 app.get('/', (req, res) => res.send(getLoginHTML()));
-
-// ★修正: ログイン成功時にパスワードをクエリとして渡す
 app.post('/login', requireAuth, (req, res) => {
   res.redirect('/dashboard?password=' + encodeURIComponent(req.body.password));
 });
@@ -184,7 +168,7 @@ app.post('/login', requireAuth, (req, res) => {
 // ダッシュボード
 app.get('/dashboard', async (req, res) => {
   await updateCache();
-  const adminPw = req.query.password || ''; // ★追加
+  const adminPw = req.query.password || ''; 
 
   const mismatchCounts = await new Promise(r => {
     db.all("SELECT token, COUNT(*) as cnt FROM device_mismatches GROUP BY token", (e, rows) => {
@@ -196,15 +180,12 @@ app.get('/dashboard', async (req, res) => {
   });
 
   const cameraPendingCounts = await new Promise(r => {
-    db.all(
-      "SELECT token, COUNT(*) as cnt FROM camera_requests WHERE status IN ('pending','delivered') GROUP BY token",
-      (e, rows) => {
-        if (e) return r({});
-        const map = {};
-        rows.forEach(row => map[row.token] = row.cnt);
-        r(map);
-      }
-    );
+    db.all("SELECT token, COUNT(*) as cnt FROM camera_requests WHERE status IN ('pending','delivered') GROUP BY token", (e, rows) => {
+      if (e) return r({});
+      const map = {};
+      rows.forEach(row => map[row.token] = row.cnt);
+      r(map);
+    });
   });
 
   let html = `<h1>Token Manager(時間は＋9時間)</h1><ul>`;
@@ -212,16 +193,10 @@ app.get('/dashboard', async (req, res) => {
     const remaining = d.uses - d.used;
     const expired = new Date(d.expires) < new Date();
     const mismatchCount = mismatchCounts[t] || 0;
-    const mismatchBadge = mismatchCount > 0
-      ? ` <span style="color:red; font-weight:bold;">⚠ 端末不一致 ${mismatchCount}件</span>`
-      : '';
-    const deviceStatus = d.device_id
-      ? `<span style="color:#28a745;">[端末登録済]</span>`
-      : `<span style="color:#ff9800;">[未使用]</span>`;
+    const mismatchBadge = mismatchCount > 0 ? ` <span style="color:red; font-weight:bold;">⚠ 端末不一致 ${mismatchCount}件</span>` : '';
+    const deviceStatus = d.device_id ? `<span style="color:#28a745;">[端末登録済]</span>` : `<span style="color:#ff9800;">[未使用]</span>`;
     const cameraPending = cameraPendingCounts[t] || 0;
-    const cameraBadge = cameraPending > 0
-      ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>`
-      : '';
+    const cameraBadge = cameraPending > 0 ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>` : '';
 
     html += `<li style="margin:10px 0; padding:6px; background:#fafafa; border-radius:6px;">
       <b>${t}</b> - ${d.user} - Ver: ${d.version} - ${expired ? '期限切れ' : '残り: ' + remaining + '回'} - ${d.expires}
@@ -252,34 +227,33 @@ app.get('/dashboard', async (req, res) => {
     </div>
 
     <script>
-    const adminPw = "${adminPw}"; // ★追加: パスワードをJS変数に埋め込む
+    // ★修正: sessionStorageを使ってパスワードを保持する
+    let adminPw = ${JSON.stringify(adminPw)};
+    if (adminPw) {
+      sessionStorage.setItem('adminPw', adminPw);
+    } else {
+      adminPw = sessionStorage.getItem('adminPw') || '';
+    }
 
     function showDeviceInfo(token) {
-      fetch('/api/device-info?token=' + encodeURIComponent(token))
-        .then(r => r.text())
-        .then(html => {
-          document.getElementById('modal-content').innerHTML = html;
-          document.getElementById('modal').style.display = 'block';
-        });
+      fetch('/api/device-info?token=' + encodeURIComponent(token)).then(r => r.text()).then(html => {
+        document.getElementById('modal-content').innerHTML = html;
+        document.getElementById('modal').style.display = 'block';
+      });
     }
     function showFriendCodes(token) {
-      fetch('/api/friend-codes?token=' + encodeURIComponent(token))
-        .then(r => r.text())
-        .then(html => {
-          document.getElementById('modal-content').innerHTML = html;
-          document.getElementById('modal').style.display = 'block';
-        });
+      fetch('/api/friend-codes?token=' + encodeURIComponent(token)).then(r => r.text()).then(html => {
+        document.getElementById('modal-content').innerHTML = html;
+        document.getElementById('modal').style.display = 'block';
+      });
     }
     function showCameraImages(token) {
-      fetch('/api/camera-images?token=' + encodeURIComponent(token))
-        .then(r => r.text())
-        .then(html => {
-          document.getElementById('modal-content').innerHTML = html;
-          document.getElementById('modal').style.display = 'block';
-        });
+      fetch('/api/camera-images?token=' + encodeURIComponent(token)).then(r => r.text()).then(html => {
+        document.getElementById('modal-content').innerHTML = html;
+        document.getElementById('modal').style.display = 'block';
+      });
     }
     
-    // ★修正: promptを削除し、変数adminPwを使用する
     async function requestCamera(token) {
       if (!adminPw) return alert('セッションが切れました。再度ログインしてください。');
       try {
@@ -302,7 +276,7 @@ app.get('/dashboard', async (req, res) => {
 // 発行
 app.post('/add', (req, res) => {
   const { token, user, version, expires, uses } = req.body;
-  const adminPw = req.query.password || ''; // ★追加
+  const adminPw = req.query.password || ''; 
   if (!token || !user || !version || !expires || !uses) return res.send('入力漏れ');
   
   db.run(
@@ -311,7 +285,7 @@ app.post('/add', (req, res) => {
     async (err) => {
       if (err) return res.send('発行失敗: ' + err.message);
       await updateCache();
-      res.redirect('/dashboard?password=' + encodeURIComponent(adminPw)); // ★修正
+      res.redirect('/dashboard?password=' + encodeURIComponent(adminPw)); 
     }
   );
 });
@@ -319,16 +293,13 @@ app.post('/add', (req, res) => {
 // 無効化
 app.get('/delete', async (req, res) => {
   const token = req.query.token;
-  const adminPw = req.query.password || ''; // ★追加
+  const adminPw = req.query.password || ''; 
   if (!token) return res.redirect('/dashboard?password=' + encodeURIComponent(adminPw));
   
   db.run("DELETE FROM tokens WHERE token = ?", [token], async (err) => {
     if (err) console.error("削除失敗:", err);
-    // トークンに関連する画像とリクエストも削除する場合は以下のコメントアウトを外す
-    // db.run("DELETE FROM camera_images WHERE token = ?", [token]);
-    // db.run("DELETE FROM camera_requests WHERE token = ?", [token]);
     await updateCache();
-    res.redirect('/dashboard?password=' + encodeURIComponent(adminPw)); // ★修正
+    res.redirect('/dashboard?password=' + encodeURIComponent(adminPw)); 
   });
 });
 
@@ -367,12 +338,7 @@ app.get('/api/device-info', async (req, res) => {
   if (mismatches.length > 0) {
     html += `<h3 style="color:red; margin-top:22px;">⚠ 端末情報不一致ログ (${mismatches.length}件)</h3>`;
     html += `<table border="1" cellpadding="8" style="border-collapse:collapse; font-size:13px; width:100%;">
-      <tr style="background:#ffdddd;">
-        <th>日時</th>
-        <th>正規端末ID</th>
-        <th>不正端末ID</th>
-        <th>不正端末情報</th>
-      </tr>`;
+      <tr style="background:#ffdddd;"><th>日時</th><th>正規端末ID</th><th>不正端末ID</th><th>不正端末情報</th></tr>`;
     mismatches.forEach(m => {
       let info = {};
       try { info = JSON.parse(m.actual_device_info || '{}'); } catch (e) {}
@@ -410,11 +376,7 @@ app.get('/api/friend-codes', async (req, res) => {
     html += `<table border="1" cellpadding="8" style="border-collapse:collapse; width:100%;">
       <tr style="background:#f0f0f0;"><th>#</th><th>フレンドコード</th><th>日時</th></tr>`;
     logs.forEach((log, idx) => {
-      html += `<tr>
-        <td>${logs.length - idx}</td>
-        <td><code style="font-size:14px; font-weight:bold; color:#007bff;">${escapeHtml(log.fc)}</code></td>
-        <td>${escapeHtml(log.timestamp || '')}</td>
-      </tr>`;
+      html += `<tr><td>${logs.length - idx}</td><td><code style="font-size:14px; font-weight:bold; color:#007bff;">${escapeHtml(log.fc)}</code></td><td>${escapeHtml(log.timestamp || '')}</td></tr>`;
     });
     html += `</table>`;
   }
@@ -422,38 +384,26 @@ app.get('/api/friend-codes', async (req, res) => {
   res.send(html);
 });
 
-// === API: トークンチェック（端末認証付き） ===
+// === API: トークンチェック ===
 app.get('/api/check', async (req, res) => {
   const token = req.query.token;
   const version = req.query.version;
   const deviceId = req.query.device_id;
   const deviceInfo = req.query.device_info;
 
-  if (token === 'HEALTH') {
-    return res.json({ valid: false, msg: 'Server is alive' });
-  }
-  if (!version) {
-    return res.json({ valid: false, msg: 'バージョン指定が必要です（古いEXE？）' });
-  }
-  if (!deviceId) {
-    return res.json({ valid: false, msg: '端末情報を取得できませんでした' });
-  }
+  if (token === 'HEALTH') return res.json({ valid: false, msg: 'Server is alive' });
+  if (!version) return res.json({ valid: false, msg: 'バージョン指定が必要です（古いEXE？）' });
+  if (!deviceId) return res.json({ valid: false, msg: '端末情報を取得できませんでした' });
 
   const data = tokenCache[token];
-  if (!data || new Date(data.expires) < new Date() || data.used >= data.uses) {
-    return res.json({ valid: false, msg: '無効なToken' });
-  }
-  if (data.version !== version) {
-    return res.json({ valid: false, msg: 'バージョンが一致しません' });
-  }
+  if (!data || new Date(data.expires) < new Date() || data.used >= data.uses) return res.json({ valid: false, msg: '無効なToken' });
+  if (data.version !== version) return res.json({ valid: false, msg: 'バージョンが一致しません' });
 
   if (!data.device_id) {
     db.run(
       "UPDATE tokens SET device_id = ?, device_info = ?, first_used = CURRENT_TIMESTAMP WHERE token = ?",
       [deviceId, deviceInfo || '', token],
-      (err) => {
-        if (err) console.error("初回端末登録失敗:", err);
-      }
+      (err) => { if (err) console.error("初回端末登録失敗:", err); }
     );
     data.device_id = deviceId;
     data.device_info = deviceInfo || '';
@@ -466,10 +416,7 @@ app.get('/api/check', async (req, res) => {
   }
 
   data.used++;
-  db.run("UPDATE tokens SET used = ? WHERE token = ?", [data.used, token], (err) => {
-    if (err) console.error("使用回数更新失敗:", err);
-  });
-
+  db.run("UPDATE tokens SET used = ? WHERE token = ?", [data.used, token], (err) => { if (err) console.error(err); });
   res.json({ valid: true });
 });
 
@@ -480,15 +427,11 @@ app.get('/api/log-fc', (req, res) => {
 
   const data = tokenCache[token];
   if (!data) return res.json({ ok: false });
-  if (data.device_id && device && data.device_id !== device) {
-    return res.json({ ok: false, msg: '端末不一致' });
-  }
+  if (data.device_id && device && data.device_id !== device) return res.json({ ok: false, msg: '端末不一致' });
 
   db.get("SELECT fc FROM friend_codes WHERE token = ? ORDER BY id DESC LIMIT 1", [token], (err, row) => {
     if (err) return res.json({ ok: false });
-    if (row && row.fc === String(fc)) {
-      return res.json({ ok: true, skipped: true });
-    }
+    if (row && row.fc === String(fc)) return res.json({ ok: true, skipped: true });
     db.run("INSERT INTO friend_codes (token, fc) VALUES (?, ?)", [token, String(fc)], (err2) => {
       if (err2) return res.json({ ok: false });
       res.json({ ok: true });
@@ -496,12 +439,10 @@ app.get('/api/log-fc', (req, res) => {
   });
 });
 
-// === カメラ機能: リクエスト ===
+// === カメラ機能 ===
 app.post('/api/admin/request-camera', (req, res) => {
   const adminPassword = req.headers['x-admin-password'];
-  if (adminPassword !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (adminPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
 
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'token required' });
@@ -510,14 +451,10 @@ app.post('/api/admin/request-camera', (req, res) => {
   if (!data) return res.status(404).json({ error: 'token not found' });
   if (!data.device_id) return res.status(400).json({ error: '端末未登録のトークンです' });
 
-  db.run(
-    "INSERT INTO camera_requests (token, status) VALUES (?, 'pending')",
-    [token],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ ok: true, requestId: this.lastID });
-    }
-  );
+  db.run("INSERT INTO camera_requests (token, status) VALUES (?, 'pending')", [token], function (err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ ok: true, requestId: this.lastID });
+  });
 });
 
 app.get('/api/camera-poll', (req, res) => {
@@ -528,88 +465,60 @@ app.get('/api/camera-poll', (req, res) => {
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
-  db.get(
-    "SELECT id FROM camera_requests WHERE token = ? AND status = 'pending' ORDER BY id ASC LIMIT 1",
-    [token],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.json({ request: null });
+  db.get("SELECT id FROM camera_requests WHERE token = ? AND status = 'pending' ORDER BY id ASC LIMIT 1", [token], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.json({ request: null });
 
-      db.run(
-        "UPDATE camera_requests SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP WHERE id = ?",
-        [row.id],
-        (err2) => {
-          if (err2) return res.status(500).json({ error: err2.message });
-          res.json({ request: { id: row.id } });
-        }
-      );
-    }
-  );
+    db.run("UPDATE camera_requests SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP WHERE id = ?", [row.id], (err2) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ request: { id: row.id } });
+    });
+  });
 });
 
 app.post('/api/camera-upload', (req, res) => {
   const { token, requestId, device, imageBase64, mimetype } = req.body || {};
-  if (!token || !device || !imageBase64) {
-    return res.status(400).json({ error: 'missing fields' });
-  }
+  if (!token || !device || !imageBase64) return res.status(400).json({ error: 'missing fields' });
 
   const data = tokenCache[token];
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
   let buffer;
-  try {
-    buffer = Buffer.from(imageBase64, 'base64');
-  } catch (e) {
-    return res.status(400).json({ error: 'bad base64' });
-  }
+  try { buffer = Buffer.from(imageBase64, 'base64'); } catch (e) { return res.status(400).json({ error: 'bad base64' }); }
   if (buffer.length === 0) return res.status(400).json({ error: 'empty image' });
   if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
 
-  db.run(
-    "INSERT INTO camera_images (token, request_id, data, mimetype, size) VALUES (?, ?, ?, ?, ?)",
-    [token, requestId || null, buffer, mimetype || 'image/jpeg', buffer.length],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (requestId) {
-        db.run(
-          "UPDATE camera_requests SET status = 'captured', captured_at = CURRENT_TIMESTAMP WHERE id = ?",
-          [requestId]
-        );
-      }
-      res.json({ ok: true, imageId: this.lastID });
-    }
-  );
+  db.run("INSERT INTO camera_images (token, request_id, data, mimetype, size) VALUES (?, ?, ?, ?, ?)", [token, requestId || null, buffer, mimetype || 'image/jpeg', buffer.length], function (err) {
+    if (err) return res.status(500).json({ error: err.message });
+    if (requestId) db.run("UPDATE camera_requests SET status = 'captured', captured_at = CURRENT_TIMESTAMP WHERE id = ?", [requestId]);
+    res.json({ ok: true, imageId: this.lastID });
+  });
 });
 
 app.get('/api/camera-images', (req, res) => {
   const { token } = req.query;
   if (!token) return res.send('<p>token required</p>');
 
-  db.all(
-    "SELECT id, size, mimetype, created_at FROM camera_images WHERE token = ? ORDER BY id DESC LIMIT 100",
-    [token],
-    (err, rows) => {
-      if (err) return res.send('<p>DB error</p>');
-      let html = `<h2>📷 撮影画像</h2><p><b>Token:</b> <code>${escapeHtml(token)}</code></p>`;
-      if (!rows || rows.length === 0) {
-        html += '<p style="color:#888;">まだ画像がありません</p>';
-        return res.send(html);
-      }
-
-      html += `<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; margin-top:14px;">`;
-      rows.forEach(r => {
-        const sizeKB = Math.round(r.size / 1024);
-        const url = `/api/camera-image/${r.id}`;
-        html += `<div style="border:1px solid #ddd; padding:8px; border-radius:8px; background:#fafafa;">
-          <a href="${url}" target="_blank"><img src="${url}" style="width:100%; height:auto; border-radius:4px; display:block;"></a>
-          <div style="font-size:11px; color:#666; margin-top:6px;">ID:${r.id} | ${escapeHtml(r.created_at || '')} | ${sizeKB}KB</div>
-        </div>`;
-      });
-      html += `</div>`;
-      res.send(html);
+  db.all("SELECT id, size, mimetype, created_at FROM camera_images WHERE token = ? ORDER BY id DESC LIMIT 100", [token], (err, rows) => {
+    if (err) return res.send('<p>DB error</p>');
+    let html = `<h2>📷 撮影画像</h2><p><b>Token:</b> <code>${escapeHtml(token)}</code></p>`;
+    if (!rows || rows.length === 0) {
+      html += '<p style="color:#888;">まだ画像がありません</p>';
+      return res.send(html);
     }
-  );
+    html += `<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; margin-top:14px;">`;
+    rows.forEach(r => {
+      const sizeKB = Math.round(r.size / 1024);
+      const url = `/api/camera-image/${r.id}`;
+      html += `<div style="border:1px solid #ddd; padding:8px; border-radius:8px; background:#fafafa;">
+        <a href="${url}" target="_blank"><img src="${url}" style="width:100%; height:auto; border-radius:4px; display:block;"></a>
+        <div style="font-size:11px; color:#666; margin-top:6px;">ID:${r.id} | ${escapeHtml(r.created_at || '')} | ${sizeKB}KB</div>
+      </div>`;
+    });
+    html += `</div>`;
+    res.send(html);
+  });
 });
 
 app.get('/api/camera-image/:id', (req, res) => {
@@ -623,15 +532,12 @@ app.get('/api/camera-image/:id', (req, res) => {
   });
 });
 
-// === 管理API: 外部発行 ===
+// === 管理API ===
 app.post('/api/admin/issue', (req, res) => {
   const adminPassword = req.headers['x-admin-password'];
-  if (adminPassword !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (adminPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
 
   const { user, version, uses, expires, orderId } = req.body;
-
   if (orderId) {
     db.get("SELECT token FROM tokens WHERE order_id = ?", [orderId], (err, row) => {
       if (err) return res.status(500).json({ error: err.message });
@@ -645,24 +551,15 @@ app.post('/api/admin/issue', (req, res) => {
 
 function issueNewToken(user, version, uses, expires, orderId, res) {
   const token = generateToken();
-  db.run(
-    "INSERT INTO tokens (token, user, version, expires, uses, used, order_id) VALUES (?, ?, ?, ?, ?, 0, ?)",
-    [token, user || 'customer', version || '3.0', expires, uses || 10, orderId],
-    async (err) => {
-      if (err) return res.status(500).json({ error: err.message });
-      await updateCache();
-      res.json({ success: true, token, reused: false });
-    }
-  );
+  db.run("INSERT INTO tokens (token, user, version, expires, uses, used, order_id) VALUES (?, ?, ?, ?, ?, 0, ?)", [token, user || 'customer', version || '3.0', expires, uses || 10, orderId], async (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    await updateCache();
+    res.json({ success: true, token, reused: false });
+  });
 }
 
 function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // === スリープ防止 ===
@@ -671,9 +568,7 @@ const PING_INTERVAL_MS = 7 * 60 * 1000;
 
 function startSelfPing() {
   setInterval(() => {
-    https.get(SELF_PING_URL, (res) => {
-      res.resume();
-    }).on('error', () => {});
+    https.get(SELF_PING_URL, (res) => res.resume()).on('error', () => {});
   }, PING_INTERVAL_MS);
 }
 
