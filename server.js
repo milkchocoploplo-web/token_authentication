@@ -52,7 +52,7 @@ db.serialize(() => {
       uses INTEGER DEFAULT 10,
       used INTEGER DEFAULT 0,
       created DATETIME DEFAULT CURRENT_TIMESTAMP,
-      version TEXT NOT NULL DEFAULT '1.0',
+      version TEXT NOT NULL DEFAULT '3.0',
       device_id TEXT DEFAULT NULL,
       device_info TEXT DEFAULT NULL,
       first_used DATETIME DEFAULT NULL,
@@ -205,7 +205,7 @@ app.get('/dashboard', async (req, res) => {
     const cameraBadge = cameraPending > 0 ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>` : '';
 
     // ★追加: オンライン状態の判定（30秒以内に通信があれば「使用中」）
-    const isOnline = d.last_seen && (Date.now() - d.last_seen < 30000);
+    const isOnline = d.last_seen && (Date.now() - d.last_seen < 5000);
     const onlineBadge = isOnline 
       ? `<span style="background:#28a745; color:white; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; margin-right:8px;">🟢 使用中</span>` 
       : `<span style="background:#ccc; color:#555; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; margin-right:8px;">⚫ オフライン</span>`;
@@ -225,7 +225,7 @@ app.get('/dashboard', async (req, res) => {
     <form action="/add?password=${encodeURIComponent(adminPw)}" method="POST">
       Token: <input name="token" value="${generateToken()}" readonly><br><br>
       ユーザー: <input name="user" required><br><br>
-      バージョン: <input name="version" value="1.0" required placeholder="例: 1.0 or legacy"><br><br>
+      バージョン: <input name="version" value="3.0" required placeholder="例: 3.0 or legacy"><br><br>
       期限: <input name="expires" type="date" required><br><br>
       回数: <input name="uses" type="number" value="10" min="1" required><br><br>
       <button>発行</button>
