@@ -576,7 +576,7 @@ function escapeHtml(s) {
 }
 
 // === スリープ防止 ===
-const SELF_PING_URL = 'https://token-authentication-j0r3.onrender.com/dashboard';
+const SELF_PING_URL = 'https://token-authentication-j0r3.onrender.com';
 const PING_INTERVAL_MS = 7 * 60 * 1000;
 
 function startSelfPing() {
