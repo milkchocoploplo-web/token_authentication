@@ -1,4 +1,4 @@
-// server.js - 完全版（セッション維持対応）
+// server.js - 完全版（オンライン状態判定機能付き）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -55,7 +55,8 @@ db.serialize(() => {
       version TEXT NOT NULL DEFAULT '1.0',
       device_id TEXT DEFAULT NULL,
       device_info TEXT DEFAULT NULL,
-      first_used DATETIME DEFAULT NULL
+      first_used DATETIME DEFAULT NULL,
+      last_seen INTEGER DEFAULT NULL
     )
   `);
   db.run(`
@@ -99,6 +100,7 @@ db.serialize(() => {
   `);
 });
 
+// マイグレーション（既存DBへのカラム追加）
 db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (err) return;
   const cols = (rows || []).map(r => r.name);
@@ -106,6 +108,10 @@ db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (!cols.includes('device_info')) db.run("ALTER TABLE tokens ADD COLUMN device_info TEXT DEFAULT NULL");
   if (!cols.includes('first_used')) db.run("ALTER TABLE tokens ADD COLUMN first_used DATETIME DEFAULT NULL");
   if (!cols.includes('order_id')) db.run("ALTER TABLE tokens ADD COLUMN order_id TEXT DEFAULT NULL");
+  if (!cols.includes('last_seen')) {
+    db.run("ALTER TABLE tokens ADD COLUMN last_seen INTEGER DEFAULT NULL");
+    console.log("[Migration] last_seen 列を追加");
+  }
 });
 
 // === キャッシュ ===
@@ -198,7 +204,14 @@ app.get('/dashboard', async (req, res) => {
     const cameraPending = cameraPendingCounts[t] || 0;
     const cameraBadge = cameraPending > 0 ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>` : '';
 
+    // ★追加: オンライン状態の判定（30秒以内に通信があれば「使用中」）
+    const isOnline = d.last_seen && (Date.now() - d.last_seen < 30000);
+    const onlineBadge = isOnline 
+      ? `<span style="background:#28a745; color:white; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; margin-right:8px;">🟢 使用中</span>` 
+      : `<span style="background:#ccc; color:#555; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; margin-right:8px;">⚫ オフライン</span>`;
+
     html += `<li style="margin:10px 0; padding:6px; background:#fafafa; border-radius:6px;">
+      ${onlineBadge}
       <b>${t}</b> - ${d.user} - Ver: ${d.version} - ${expired ? '期限切れ' : '残り: ' + remaining + '回'} - ${d.expires}
       ${deviceStatus}${mismatchBadge}${cameraBadge}<br>
       <a href="/delete?token=${t}&password=${encodeURIComponent(adminPw)}" style="color:red;" onclick="return confirm('無効化？');">[無効化]</a>
@@ -227,13 +240,9 @@ app.get('/dashboard', async (req, res) => {
     </div>
 
     <script>
-    // ★修正: sessionStorageを使ってパスワードを保持する
     let adminPw = ${JSON.stringify(adminPw)};
-    if (adminPw) {
-      sessionStorage.setItem('adminPw', adminPw);
-    } else {
-      adminPw = sessionStorage.getItem('adminPw') || '';
-    }
+    if (adminPw) sessionStorage.setItem('adminPw', adminPw);
+    else adminPw = sessionStorage.getItem('adminPw') || '';
 
     function showDeviceInfo(token) {
       fetch('/api/device-info?token=' + encodeURIComponent(token)).then(r => r.text()).then(html => {
@@ -253,7 +262,6 @@ app.get('/dashboard', async (req, res) => {
         document.getElementById('modal').style.display = 'block';
       });
     }
-    
     async function requestCamera(token) {
       if (!adminPw) return alert('セッションが切れました。再度ログインしてください。');
       try {
@@ -416,7 +424,8 @@ app.get('/api/check', async (req, res) => {
   }
 
   data.used++;
-  db.run("UPDATE tokens SET used = ? WHERE token = ?", [data.used, token], (err) => { if (err) console.error(err); });
+  data.last_seen = Date.now(); // ★追加: 認証時にも生存確認更新
+  db.run("UPDATE tokens SET used = ?, last_seen = ? WHERE token = ?", [data.used, data.last_seen, token], (err) => { if (err) console.error(err); });
   res.json({ valid: true });
 });
 
@@ -464,6 +473,10 @@ app.get('/api/camera-poll', (req, res) => {
   const data = tokenCache[token];
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  // ★追加: ポーリング（5秒毎）を生存確認として利用
+  data.last_seen = Date.now();
+  db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
 
   db.get("SELECT id FROM camera_requests WHERE token = ? AND status = 'pending' ORDER BY id ASC LIMIT 1", [token], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
