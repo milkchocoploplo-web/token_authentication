@@ -273,7 +273,6 @@ app.get('/dashboard', async (req, res) => {
     else adminPw = sessionStorage.getItem('adminPw') || '';
 
     function closeModal() {
-      // Fetch通信を強制終了
       if (window.screenStreamAbort) {
         window.screenStreamAbort.abort(); 
         window.screenStreamAbort = null;
@@ -301,13 +300,13 @@ app.get('/dashboard', async (req, res) => {
       });
     }
 
-    // ★修正: Fetchストリーム + Canvas 描画に変更（ちらつき防止）
+    // ★修正: ブラウザ側のストリーム解析を軽量化
     async function showScreenMonitor(token) {
       if (window.screenStreamAbort) window.screenStreamAbort.abort();
       
       document.getElementById('modal-content').innerHTML = \`
         <h2>🖥️ 画面モニター</h2>
-        <p><b>Token:</b> <code>\${token}</code> <span style="color:red; font-size:12px;">(30FPS ストリーミング)</span></p>
+        <p><b>Token:</b> <code>\${token}</code> <span style="color:red; font-size:12px;">(ストリーミング)</span></p>
         <div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center;">
           <canvas id="screen-canvas" style="width:100%; height:auto; display:block;"></canvas>
         </div>
@@ -315,7 +314,7 @@ app.get('/dashboard', async (req, res) => {
       document.getElementById('modal').style.display = 'block';
 
       const canvas = document.getElementById('screen-canvas');
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { alpha: false });
       const controller = new AbortController();
       window.screenStreamAbort = controller;
 
@@ -328,15 +327,14 @@ app.get('/dashboard', async (req, res) => {
           const { value, done } = await reader.read();
           if (done) break;
 
-          // 受け取ったデータをバッファに追加
           const newBuf = new Uint8Array(buffer.length + value.length);
           newBuf.set(buffer);
           newBuf.set(value, buffer.length);
           buffer = newBuf;
 
-          // JPEGの開始(FF D8)と終了(FF D9)を探してパース
           let start = -1;
           let end = -1;
+          // 終了マーカー(FF D9)を優先的に探す
           for (let i = 0; i < buffer.length - 1; i++) {
             if (buffer[i] === 0xFF && buffer[i + 1] === 0xD8) start = i;
             if (buffer[i] === 0xFF && buffer[i + 1] === 0xD9) { end = i + 2; break; }
@@ -346,7 +344,6 @@ app.get('/dashboard', async (req, res) => {
             const jpegData = buffer.slice(start, end);
             buffer = buffer.slice(end); // 残りのバッファを保持
 
-            // 画像をCanvasに描画（ちらつかない）
             createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' })).then(bitmap => {
               if (canvas.width !== bitmap.width) {
                 canvas.width = bitmap.width;
@@ -358,7 +355,7 @@ app.get('/dashboard', async (req, res) => {
           }
         }
       } catch (e) {
-        console.log('Screen stream disconnected', e);
+        if (e.name !== 'AbortError') console.log('Screen stream disconnected', e);
       }
     }
 
