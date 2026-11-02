@@ -1,4 +1,4 @@
-// server.js - 完全版（プッシュ型ストリーミング + Canvas描画で残像解消）
+// server.js - 完全版（プッシュ配信 + imgタグで確実に表示）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -135,7 +135,7 @@ db.all("PRAGMA table_info(camera_images)", (err, rows) => {
 
 // === キャッシュ ===
 let tokenCache = {};
-const latestScreenFrames = {};
+const latestScreenFrames = {}; // 最新の画面フレームをメモリに保持
 
 async function updateCache() {
   return new Promise((resolve) => {
@@ -278,10 +278,9 @@ app.get('/dashboard', async (req, res) => {
     else adminPw = sessionStorage.getItem('adminPw') || '';
 
     function closeModal() {
-      if (window.screenStreamAbort) {
-        window.screenStreamAbort.abort(); 
-        window.screenStreamAbort = null;
-      }
+      const img = document.getElementById('screen-live-img');
+      if (img) img.src = '';
+      
       document.getElementById('modal').style.display = 'none';
       document.getElementById('modal-content').innerHTML = '';
     }
@@ -305,82 +304,16 @@ app.get('/dashboard', async (req, res) => {
       });
     }
 
-    async function showScreenMonitor(token) {
-      if (window.screenStreamAbort) window.screenStreamAbort.abort();
-      
+    function showScreenMonitor(token) {
       var contentHtml = '';
       contentHtml += '<h2>🖥️ 画面モニター</h2>';
       contentHtml += '<p><b>Token:</b> <code>' + token + '</code> <span style="color:red; font-size:12px;">(ストリーミング)</span></p>';
       contentHtml += '<div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center; min-height: 300px;">';
-      contentHtml += '<canvas id="screen-canvas" style="width:100%; height:auto; display:block;"></canvas>';
+      contentHtml += '<img id="screen-live-img" src="/api/screen-stream?token=' + encodeURIComponent(token) + '" style="width:100%; height:auto; display:block;">';
       contentHtml += '</div>';
       
       document.getElementById('modal-content').innerHTML = contentHtml;
       document.getElementById('modal').style.display = 'block';
-
-      const canvas = document.getElementById('screen-canvas');
-      const ctx = canvas.getContext('2d', { alpha: false });
-      const controller = new AbortController();
-      window.screenStreamAbort = controller;
-
-      try {
-        const res = await fetch('/api/screen-stream?token=' + encodeURIComponent(token), { signal: controller.signal });
-        const reader = res.body.getReader();
-        let buffer = new Uint8Array(0);
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          const newBuf = new Uint8Array(buffer.length + value.length);
-          newBuf.set(buffer);
-          newBuf.set(value, buffer.length);
-          buffer = newBuf;
-
-          // バッファ内の完全なJPEGをすべて探して描画する
-          while (true) {
-            let start = -1;
-            let end = -1;
-            // JPEGの開始マーカー (FF D8) を探す
-            for (let i = 0; i < buffer.length - 1; i++) {
-              if (buffer[i] === 0xFF && buffer[i + 1] === 0xD8) {
-                start = i;
-                break;
-              }
-            }
-            if (start === -1) break;
-
-            // JPEGの終了マーカー (FF D9) を探す
-            for (let i = start + 2; i < buffer.length - 1; i++) {
-              if (buffer[i] === 0xFF && buffer[i + 1] === 0xD9) {
-                end = i + 2;
-                break;
-              }
-            }
-            if (end === -1) break;
-
-            const jpegData = buffer.slice(start, end);
-            buffer = buffer.slice(end); // バッファを進める
-
-            const blob = new Blob([jpegData], { type: 'image/jpeg' });
-            const url = URL.createObjectURL(blob);
-            
-            // new Image() で確実にデコードして描画
-            const img = new Image();
-            img.onload = () => {
-              if (canvas.width !== img.width) {
-                canvas.width = img.width;
-                canvas.height = img.height;
-              }
-              ctx.drawImage(img, 0, 0);
-              URL.revokeObjectURL(url);
-            };
-            img.src = url;
-          }
-        }
-      } catch (e) {
-        if (e.name !== 'AbortError') console.log('Screen stream disconnected', e);
-      }
     }
 
     async function requestCamera(token) {
@@ -641,7 +574,7 @@ app.post('/api/camera-upload', (req, res) => {
   // 画面配信の場合はDBに保存せずメモリに保持し、即座に配信（プッシュ）
   if (type === 'screen') {
     latestScreenFrames[token] = buffer;
-    screenEmitter.emit(`screen_${token}`, buffer); // 接続中のブラウザへ即時送信
+    screenEmitter.emit(`screen_${token}`, buffer);
     return res.json({ ok: true });
   }
 
@@ -678,7 +611,7 @@ app.get('/api/camera-images', (req, res) => {
   });
 });
 
-// プッシュ型ストリーミング配信
+// プッシュ型ストリーミング配信（新しい画像が来た時だけブラウザへ送信）
 app.get('/api/screen-stream', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('token required');
@@ -695,12 +628,10 @@ app.get('/api/screen-stream', (req, res) => {
     res.write('\r\n');
   };
 
-  // 既に最新のフレームがあれば最初に1枚送る
   if (latestScreenFrames[token]) {
     onFrame(latestScreenFrames[token]);
   }
 
-  // 新しい画像が届くたびに送信（setIntervalは使わない）
   screenEmitter.on(`screen_${token}`, onFrame);
 
   req.on('close', () => {
