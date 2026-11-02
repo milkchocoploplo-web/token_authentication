@@ -321,7 +321,7 @@ app.get('/dashboard', async (req, res) => {
         if (img) {
           img.src = '/api/screen-stream?token=' + encodeURIComponent(token) + '&t=' + Date.now();
         }
-      }, 10000);
+      }, 100);
     }
 
     async function requestCamera(token) {
