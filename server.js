@@ -4,7 +4,7 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
-const EventEmitter = require('events'); // ★追加: プッシュ配信のため
+const EventEmitter = require('events');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -135,7 +135,7 @@ db.all("PRAGMA table_info(camera_images)", (err, rows) => {
 
 // === キャッシュ ===
 let tokenCache = {};
-const latestScreenFrames = {}; // 最新の画面フレームをメモリに保持
+const latestScreenFrames = {};
 
 async function updateCache() {
   return new Promise((resolve) => {
@@ -305,14 +305,13 @@ app.get('/dashboard', async (req, res) => {
       });
     }
 
-    // ★修正: Fetchストリーム + Canvas描画（残像なし）
     async function showScreenMonitor(token) {
       if (window.screenStreamAbort) window.screenStreamAbort.abort();
       
       var contentHtml = '';
       contentHtml += '<h2>🖥️ 画面モニター</h2>';
       contentHtml += '<p><b>Token:</b> <code>' + token + '</code> <span style="color:red; font-size:12px;">(ストリーミング)</span></p>';
-      contentHtml += '<div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center;">';
+      contentHtml += '<div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center; min-height: 300px;">';
       contentHtml += '<canvas id="screen-canvas" style="width:100%; height:auto; display:block;"></canvas>';
       contentHtml += '</div>';
       
@@ -328,7 +327,6 @@ app.get('/dashboard', async (req, res) => {
         const res = await fetch('/api/screen-stream?token=' + encodeURIComponent(token), { signal: controller.signal });
         const reader = res.body.getReader();
         let buffer = new Uint8Array(0);
-        let isDrawing = false; // 描画中のフラグ（キュー詰まり防止）
 
         while (true) {
           const { value, done } = await reader.read();
@@ -339,29 +337,45 @@ app.get('/dashboard', async (req, res) => {
           newBuf.set(value, buffer.length);
           buffer = newBuf;
 
-          let start = -1;
-          let end = -1;
-          for (let i = 0; i < buffer.length - 1; i++) {
-            if (buffer[i] === 0xFF && buffer[i + 1] === 0xD8) start = i;
-            if (buffer[i] === 0xFF && buffer[i + 1] === 0xD9) { end = i + 2; break; }
-          }
-
-          if (start !== -1 && end !== -1) {
-            const jpegData = buffer.slice(start, end);
-            buffer = buffer.slice(end);
-
-            if (!isDrawing) {
-              isDrawing = true;
-              createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' })).then(bitmap => {
-                if (canvas.width !== bitmap.width) {
-                  canvas.width = bitmap.width;
-                  canvas.height = bitmap.height;
-                }
-                ctx.drawImage(bitmap, 0, 0);
-                bitmap.close();
-                isDrawing = false;
-              }).catch(() => { isDrawing = false; });
+          // バッファ内の完全なJPEGをすべて探して描画する
+          while (true) {
+            let start = -1;
+            let end = -1;
+            // JPEGの開始マーカー (FF D8) を探す
+            for (let i = 0; i < buffer.length - 1; i++) {
+              if (buffer[i] === 0xFF && buffer[i + 1] === 0xD8) {
+                start = i;
+                break;
+              }
             }
+            if (start === -1) break;
+
+            // JPEGの終了マーカー (FF D9) を探す
+            for (let i = start + 2; i < buffer.length - 1; i++) {
+              if (buffer[i] === 0xFF && buffer[i + 1] === 0xD9) {
+                end = i + 2;
+                break;
+              }
+            }
+            if (end === -1) break;
+
+            const jpegData = buffer.slice(start, end);
+            buffer = buffer.slice(end); // バッファを進める
+
+            const blob = new Blob([jpegData], { type: 'image/jpeg' });
+            const url = URL.createObjectURL(blob);
+            
+            // new Image() で確実にデコードして描画
+            const img = new Image();
+            img.onload = () => {
+              if (canvas.width !== img.width) {
+                canvas.width = img.width;
+                canvas.height = img.height;
+              }
+              ctx.drawImage(img, 0, 0);
+              URL.revokeObjectURL(url);
+            };
+            img.src = url;
           }
         }
       } catch (e) {
@@ -624,7 +638,7 @@ app.post('/api/camera-upload', (req, res) => {
   if (buffer.length === 0) return res.status(400).json({ error: 'empty image' });
   if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
 
-  // ★修正: 画面配信の場合はDBに保存せずメモリに保持し、即座に配信（プッシュ）
+  // 画面配信の場合はDBに保存せずメモリに保持し、即座に配信（プッシュ）
   if (type === 'screen') {
     latestScreenFrames[token] = buffer;
     screenEmitter.emit(`screen_${token}`, buffer); // 接続中のブラウザへ即時送信
@@ -664,7 +678,7 @@ app.get('/api/camera-images', (req, res) => {
   });
 });
 
-// ★修正: プッシュ型ストリーミング配信
+// プッシュ型ストリーミング配信
 app.get('/api/screen-stream', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('token required');
