@@ -314,6 +314,14 @@ app.get('/dashboard', async (req, res) => {
       
       document.getElementById('modal-content').innerHTML = contentHtml;
       document.getElementById('modal').style.display = 'block';
+         // ★追加: 10秒ごとにimgのsrcを更新してブラウザ側のバッファをリセットする（残像対策）
+      if (window.screenRefreshInterval) clearInterval(window.screenRefreshInterval);
+      window.screenRefreshInterval = setInterval(() => {
+        const img = document.getElementById('screen-live-img');
+        if (img) {
+          img.src = '/api/screen-stream?token=' + encodeURIComponent(token) + '&t=' + Date.now();
+        }
+      }, 10000);
     }
 
     async function requestCamera(token) {
