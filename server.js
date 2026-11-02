@@ -305,17 +305,18 @@ app.get('/dashboard', async (req, res) => {
       });
     }
 
-    // ★修正: シンプルな img タグによるストリーム表示に戻す
+    // ★修正: 文字列の連結にしてエスケープ不要にしたシンプルなストリーム表示
     function showScreenMonitor(token) {
       if (screenMonitorInterval) clearInterval(screenMonitorInterval);
 
-      document.getElementById('modal-content').innerHTML = `
-        <h2>🖥️ 画面モニター</h2>
-        <p><b>Token:</b> <code>${token}</code> <span style="color:red; font-size:12px;">(ストリーミング)</span></p>
-        <div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center;">
-          <img id="screen-live-img" src="/api/screen-stream?token=${encodeURIComponent(token)}" style="width:100%; height:auto; display:block;" onerror="this.style.opacity=0.5;">
-        </div>
-      `;
+      var contentHtml = '';
+      contentHtml += '<h2>🖥️ 画面モニター</h2>';
+      contentHtml += '<p><b>Token:</b> <code>' + token + '</code> <span style="color:red; font-size:12px;">(ストリーミング)</span></p>';
+      contentHtml += '<div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; display:flex; justify-content:center; align-items:center;">';
+      contentHtml += '<img id="screen-live-img" src="/api/screen-stream?token=' + encodeURIComponent(token) + '" style="width:100%; height:auto; display:block;" onerror="this.style.opacity=0.5;">';
+      contentHtml += '</div>';
+      
+      document.getElementById('modal-content').innerHTML = contentHtml;
       document.getElementById('modal').style.display = 'block';
     }
 
